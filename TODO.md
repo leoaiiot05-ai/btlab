@@ -38,3 +38,5 @@ Nothing here is in scope for v1. Do not build any of it without being asked. App
 
 - [ ] Daily backup of `data/`.
 - [ ] Run as a Windows service instead of a logon task.
+- [ ] Reload `config.toml` and `taxes.toml` without a restart; today both are read once at startup (§23). Seam: `load_config` and `load_taxes`, called from `__main__.py`.
+- [ ] Format checks for URLs and email addresses in `config.toml`; today a malformed one fails at its first use. Seam: the per-key validators in `config.py`.

@@ -1,0 +1,5 @@
+numpy
+aiohttp
+tzdata
+ib_async==2.1.0
+pytest

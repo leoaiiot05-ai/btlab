@@ -1,0 +1,8 @@
+config.toml
+data/
+logs/
+.venv/
+__pycache__/
+.pytest_cache/
+.claude-runs/
+.claude/settings.local.json

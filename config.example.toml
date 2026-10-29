@@ -1,0 +1,57 @@
+mode = "test"                 # "test": live orders are virtual. "trade": confirmed orders go to IB.
+
+[web]
+port = 8091                   # always bound to 127.0.0.1; publish it with Tailscale Serve
+token = "change-me"           # random, at least 16 characters
+
+[tiingo]
+api_key = ""
+
+[finmind]
+token = ""
+
+[fred]
+api_key = ""
+
+[spylead]
+url = "http://127.0.0.1:8090" # empty disables the import
+token = ""
+
+[ibguard]
+url = "http://127.0.0.1:8080" # empty disables coordination
+token = ""
+
+[ib]
+host = "127.0.0.1"            # empty disables IB: no minute bars, no orders
+port = 4002                   # IB Gateway paper; live is 4001
+client_id = 31                # keep stable; must differ from ibguard's 17
+account = ""                  # required when the login has several accounts
+
+[minute]
+backfill_years = 3
+
+[orders]
+us_order_kind = "MOO"         # "MOO" or "LIMIT"
+us_limit_offset_pct = 1.0
+tw_limit_offset_pct = 3.0
+
+# [limits]                    # required in trade mode, with your own numbers (§15.3)
+# us_max_orders_per_day = ...
+# tw_max_orders_per_day = ...
+# max_order_pct_of_equity = ...
+# us_max_order_value = ...     # USD
+# tw_max_order_value = ...     # TWD
+
+[schedule]
+enabled = true
+us_update = "08:30"           # Asia/Taipei, Tuesday to Saturday
+tw_update = "18:00"           # Asia/Taipei, Monday to Friday
+
+[email]                       # optional; an empty smtp_host disables email
+smtp_host = ""
+smtp_port = 587
+username = ""
+password = ""
+sender = ""
+recipient = ""
+language = "zh-TW"            # or "en"
