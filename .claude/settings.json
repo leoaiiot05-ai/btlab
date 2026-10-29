@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "claude-opus-5-5",
+  "ultracode": true,
+  "env": {
+    "CLAUDE_CODE_EFFORT_LEVEL": "max"
+  },
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(py *)",
+      "Bash(.venv/bin/python *)",
+      "Bash(.venv/Scripts/python *)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "PowerShell(python *)",
+      "PowerShell(py *)",
+      "PowerShell(.venv/Scripts/python *)",
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git show*)",
+      "Bash(git rev-parse*)",
+      "Bash(git ls-files*)",
+      "Bash(git blame*)",
+      "Bash(date*)",
+      "Bash(ls*)",
+      "Bash(pwd)",
+      "Bash(wc *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Workflow"
+    ],
+    "deny": [
+      "Bash(*-m btlab*)",
+      "PowerShell(*-m btlab*)",
+      "Bash(git commit*)",
+      "Bash(git push*)",
+      "Bash(git pull*)",
+      "Bash(git merge*)",
+      "Bash(git rebase*)",
+      "Bash(git reset*)",
+      "Bash(git checkout*)",
+      "Bash(git switch*)",
+      "Bash(git stash*)",
+      "Bash(git tag*)",
+      "Bash(git filter-branch*)",
+      "PowerShell(git commit*)",
+      "PowerShell(git push*)",
+      "PowerShell(git pull*)",
+      "PowerShell(git merge*)",
+      "PowerShell(git rebase*)",
+      "PowerShell(git reset*)",
+      "PowerShell(git checkout*)",
+      "PowerShell(git switch*)",
+      "PowerShell(git stash*)",
+      "PowerShell(git tag*)",
+      "PowerShell(git filter-branch*)",
+      "Edit(buildctl/**)"
+    ]
+  }
+}
