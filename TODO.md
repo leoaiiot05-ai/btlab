@@ -40,3 +40,5 @@ Nothing here is in scope for v1. Do not build any of it without being asked. App
 - [ ] Run as a Windows service instead of a logon task.
 - [ ] Reload `config.toml` and `taxes.toml` without a restart; today both are read once at startup (§23). Seam: `load_config` and `load_taxes`, called from `__main__.py`.
 - [ ] Format checks for URLs and email addresses in `config.toml`; today a malformed one fails at its first use. Seam: the per-key validators in `config.py`.
+- [ ] Retention for the `events` and `job_runs` tables; today both keep every row (a few thousand a year). Seam: `append_event` and `start_job_run` in `store.py`.
+- [ ] Schema upgrades for the databases; today the store creates schema version 1 and refuses a file with a newer `user_version`. Seam: where `store._Database` reads `user_version`.
