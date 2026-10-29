@@ -1,5 +1,5 @@
 {
-  "by": "kit",
-  "holder": "local",
-  "since": "2026-10-29T00:00:00+00:00"
+  "by": "build.cmd --cloud",
+  "holder": "cloud",
+  "since": "2026-10-29T19:02:21+00:00"
 }
