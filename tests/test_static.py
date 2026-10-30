@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from btlab import backtest, exits, jobs, optimize, rules, web
+from btlab import backtest, exits, jobs, live, optimize, rules, web
 from btlab.builtins import BUILTINS
 from btlab.config import MODES
 from btlab.engine import EXIT_REASONS
@@ -84,6 +84,10 @@ CODES = {
     "window": optimize.WINDOW_STATUSES,
     "op": rules.OPS,
     "side": rules.SIDES,
+    "batch": live.BATCH_STATUSES,
+    "line": live.LINE_STATUSES,
+    "action": ("BUY", "SELL"),
+    "order_kind": ("MOO", "LIMIT"),
     "operand": {"value", "series", *(operand.kind for operand in operands().values())},
     "output": {*(builtin.output for builtin in BUILTINS.values()), *OUTPUTS.values(), "ORDERS"},
 }

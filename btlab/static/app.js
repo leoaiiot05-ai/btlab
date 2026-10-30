@@ -9,14 +9,14 @@ import * as backtest from "./views/backtest.js";
 import * as compare from "./views/compare.js";
 import * as data from "./views/data.js";
 import * as home from "./views/home.js";
-import * as later from "./views/later.js";
+import * as live from "./views/live.js";
 import * as optimize from "./views/optimize.js";
 import * as results from "./views/results.js";
 import * as rules from "./views/rules.js";
 import * as settings from "./views/settings.js";
 
 const TABS = ["home", "data", "backtest", "results", "optimize", "live", "settings"];
-const VIEWS = {home, data, backtest, rules, results, compare, optimize, settings, live: later};
+const VIEWS = {home, data, backtest, rules, results, compare, optimize, settings, live};
 // Views opened from a tab's view keep that tab lit.
 const PARENTS = {rules: "backtest", compare: "results"};
 // What still works offline: the stored results, and the settings.

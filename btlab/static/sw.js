@@ -3,7 +3,7 @@
 
 // A hash of the shell's contents, which tests/test_static.py recomputes: a changed shell file needs a new value, and the
 // changed worker then installs a fresh shell cache.
-const VERSION = "e44de46d99ff";
+const VERSION = "b987730ae1e1";
 const SHELL_CACHE = `btlab-shell-${VERSION}`;
 const RESULTS_CACHE = "btlab-results";
 // Tailscale Serve answers these while btlab is down: no answer from btlab, like a failed network.
@@ -31,7 +31,7 @@ const SHELL = [
   "/views/compare.js",
   "/views/data.js",
   "/views/home.js",
-  "/views/later.js",
+  "/views/live.js",
   "/views/optimize.js",
   "/views/results.js",
   "/views/rules.js",

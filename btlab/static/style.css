@@ -189,6 +189,14 @@ progress { width: 100%; height: 10px; }
 }
 .button { cursor: pointer; }
 .button:disabled { opacity: 0.45; cursor: not-allowed; }
+.dialog {
+  max-width: min(560px, calc(100vw - 32px));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--ink);
+}
+.dialog::backdrop { background: rgb(15 23 42 / 0.5); }
 .button.primary { background: var(--accent); border-color: var(--accent); color: #ffffff; font-weight: 600; }
 .button.danger { color: var(--down); border-color: var(--down); }
 input[type="checkbox"].toggle { min-height: 0; width: 26px; height: 26px; }
