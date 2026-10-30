@@ -13,7 +13,7 @@ export function render(root, context) {
     h("h2", {text: t("view.home")}),
     h("section", {class: "cards"}, Object.entries(state.markets).map(([market, info]) => marketCard(market, info, state))),
     h("h3", {text: t("home.services")}),
-    h("section", {class: "cards"}, spyleadCard(state.app.services.spylead)),
+    h("section", {class: "cards"}, ibCard(state.app.services.ib), spyleadCard(state.app.services.spylead)),
     h("h3", {text: t("home.jobs")}),
     h("section", {id: "jobs", class: "cards"}, jobCards(context)),
     h("h3", {text: t("home.events")}),
@@ -40,6 +40,17 @@ function marketCard(market, info, state) {
     row(t("home.last_update"), last ? `${code("outcome", last.outcome)} · ${moment(last.finished_at)}` : "—"),
     last && last.message ? h("p", {class: "detail", text: last.message}) : null,
     row(t("home.next_update"), next ? moment(next) : t("home.schedule_off")));
+}
+
+function ibCard(ib) {
+  // The connection, the account kind, and per market whether IB serves its minute bars (§5.4).
+  if (!ib.configured) return h("article", {class: "card quiet"}, h("h4", {text: "IB"}), h("p", {text: t("home.not_configured")}));
+  return h("article", {class: "card"},
+    h("h4", {text: "IB"}),
+    row(t("home.connection"), ib.connected ? t("home.connected") : t("home.disconnected")),
+    row(t("home.account"), ib.account_kind ? code("account", ib.account_kind) : "—"),
+    Object.entries(ib.permissions).map(([market, permission]) =>
+      row(t("home.minute_data", {market: code("market", market)}), permission ? code("coverage", permission) : "—")));
 }
 
 function spyleadCard(spylead) {

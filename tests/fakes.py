@@ -135,6 +135,59 @@ class FakeSpylead:
         return web.json_response(self.charts[request.path])
 
 
+class FakeIB:
+    """ib_async's IB as ib_link's HistoryPort uses it (§24.1). It opens no connection: connectAsync records its
+    arguments, contract details come from details (by symbol), and each historical request is recorded with the time on
+    clock, then answered by history(contract, endDateTime): bars, or an exception to raise."""
+
+    def __init__(self, clock: Callable[[], float], history: Callable[[Any, datetime], Any] | None = None,
+                 accounts: tuple[str, ...] = ("DU1234567",)) -> None:
+        self.clock, self.history, self.accounts = clock, history, list(accounts)
+        self.refusal: BaseException | None = None
+        self.up = False
+        self.connects: list[dict] = []
+        self.details: dict[str, Any] = {}
+        self.asked: list[Any] = []
+        self.requests: list[dict] = []
+
+    async def connectAsync(self, host: str, port: int, clientId: int, timeout: float, readonly: bool, account: str) -> None:
+        self.connects.append({"host": host, "port": port, "clientId": clientId, "timeout": timeout, "readonly": readonly,
+                              "account": account})
+        if self.refusal is not None:
+            raise self.refusal
+        self.up = True
+
+    def isConnected(self) -> bool:
+        return self.up
+
+    def disconnect(self) -> None:
+        self.up = False
+
+    def managedAccounts(self) -> list[str]:
+        return self.accounts
+
+    def reqContractDetailsAsync(self, contract: Any):
+        self.asked.append(contract)
+        answer = self.details.get(contract.symbol, [])
+
+        async def answered():
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        return answered()
+
+    async def reqHistoricalDataAsync(self, contract: Any, endDateTime: datetime, durationStr: str, barSizeSetting: str,
+                                     whatToShow: str, useRTH: bool, formatDate: int, timeout: float) -> list:
+        self.requests.append({"contract": contract, "endDateTime": endDateTime, "durationStr": durationStr,
+                              "barSizeSetting": barSizeSetting, "whatToShow": whatToShow, "useRTH": useRTH,
+                              "formatDate": formatDate, "timeout": timeout, "at": self.clock()})
+        answer = self.history(contract, endDateTime)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
 class FakeTime:
     """An epoch-seconds clock that only the injected sleep moves. Every sleep is recorded."""
 

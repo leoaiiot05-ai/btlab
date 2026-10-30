@@ -38,14 +38,19 @@ export function render(root, context) {
       reload();
     }),
     symbols,
+    h("h3", {text: t("data.minute")}),
+    minuteControls(context, message),
+    h("div", {id: "minute-job"}),
     h("h3", {text: t("data.spylead")}),
     spylead);
   showJob(root, context);
+  showMinute(root, context);
   reload();
 }
 
 export function update(root, context) {
   showJob(root, context);
+  showMinute(root, context);
 }
 
 export function refreshOn(events, since) {
@@ -58,11 +63,46 @@ function showJob(root, context) {
   const job = context.state.jobs.DATA;
   if (!box) return;
   clear(box);
-  if (job) {
-    box.append(h("p", {class: "detail"},
-      `${code("job", job.kind)} · ${code("phase", job.phase)}${job.total ? ` · ${job.done} / ${job.total}` : ""}`,
-      job.item ? ` · ${job.item}` : "", job.message ? ` · ${job.message}` : ""));
-  }
+  if (job) box.append(jobLine(job));
+}
+
+function jobLine(job) {
+  return h("p", {class: "detail"},
+    `${code("job", job.kind)} · ${code("phase", job.phase)}${job.total ? ` · ${job.done} / ${job.total}` : ""}`,
+    job.item ? ` · ${job.item}` : "", job.message ? ` · ${job.message}` : "");
+}
+
+function minuteControls(context, message) {
+  const act = (path, body, done) => async () => {
+    try {
+      await post(path, body);
+      if (done) message.textContent = done;
+      context.refresh();
+    } catch (error) {
+      message.textContent = errorText(error);
+    }
+  };
+  const start = button(t("data.backfill"), act("/api/minute/backfill", {}, t("data.backfill_started")), "primary");
+  const stop = button(t("data.stop_backfill"), act("/api/jobs/MINUTE/cancel", {}, ""));
+  start.id = "backfill-start";
+  stop.id = "backfill-stop";
+  return h("div", {class: "actions"}, start, stop);
+}
+
+function showMinute(root, context) {
+  // IB's minute bars (§17.3): whether they are on, the backfill's progress, and each market IB refused (§5.4).
+  const box = root.querySelector("#minute-job");
+  if (!box) return;
+  const ib = context.state.app.services.ib;
+  const job = context.state.jobs.MINUTE;
+  root.querySelector("#backfill-start").disabled = !ib.configured || Boolean(job);
+  root.querySelector("#backfill-stop").disabled = !job;
+  append(clear(box), [
+    ib.configured ? null : h("p", {class: "quiet", text: t("data.ib_off")}),
+    job ? jobLine(job) : null,
+    Object.entries(ib.permissions).filter(([, permission]) => permission === "NO_PERMISSION")
+      .map(([market]) => h("p", {class: "warning", text: t("data.no_permission", {market: code("market", market)})})),
+  ]);
 }
 
 async function startUpdate(market, context, message) {

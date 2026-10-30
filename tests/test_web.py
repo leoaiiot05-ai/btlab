@@ -501,6 +501,42 @@ def test_the_state_document_shows_the_next_updates_and_trade_limits(tmp_path):
     assert found["app"]["limits"]["us_max_orders_per_day"] == 5 and found["app"]["mode"] == "trade"
 
 
+# ----- IB minute bars (§5.4, §17.3, AC-24) -----
+
+
+def test_minute_backfill_starts_and_the_state_shows_ib(world):
+    world.store.save_setting("ib_permission/TW", "NO_PERMISSION")
+
+    async def scenario(client):
+        found = [await answer(await client.post("/api/minute/backfill", json={})),
+                 await answer(await client.post("/api/minute/backfill", json={"market": "TW"})),
+                 await answer(await client.post("/api/minute/backfill", json={"market": "JP"}))]
+        world.jobs.busy.add("MINUTE")
+        found.append(await answer(await client.post("/api/minute/backfill", json={})))
+        found.append(await answer(await client.get("/api/state")))
+        return found
+
+    every, tw, unknown, busy, (_, state) = serve(world, scenario)
+    assert every == tw == (202, {"lane": "MINUTE", "kind": "MINUTE_BACKFILL"}) and world.jobs.backfills == [None, "TW"]
+    assert unknown[0] == 400 and unknown[1]["path"] == "market"
+    assert busy[0] == 409 and busy[1]["error"] == "JOB_RUNNING"
+    assert state["app"]["services"]["ib"] == {"configured": True, "connected": False, "account_kind": None,
+                                              "permissions": {"US": None, "TW": "NO_PERMISSION"}}
+
+
+def test_minute_backfill_needs_ib_configured(tmp_path):
+    world = make_world(tmp_path, edited("ib", "host", ""))
+    try:
+        async def scenario(client):
+            return await answer(await client.post("/api/minute/backfill", json={}))
+
+        status, body = serve(world, scenario)
+    finally:
+        world.store.close()
+        world.minute.close()
+    assert (status, body["error"]) == (409, "IB_NOT_CONFIGURED") and world.jobs.backfills == []
+
+
 # ----- spylead (§5.6, AC-23) -----
 
 
