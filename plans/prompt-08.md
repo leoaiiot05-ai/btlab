@@ -57,3 +57,11 @@ Covers SPEC.md §5.3, §10.1, §10.9, §10.11, §12 and §17.5. Acceptance: AC-1
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-11 holds, and so does the backtest part of AC-29.** `.venv/bin/python -m pytest -q`: 738 passed (also with `-X dev -W error`). The metric tests compare with values computed by Python's `statistics` module.
+- Built as planned, plus `save_result(store, result, created_at)` in backtest.py, which maps a `BacktestResult` onto `Store.save_backtest`.
+- `RunConfigError.errors` is a list of `(path, message)`; the web layer (prompt 15) answers INVALID_FIELD with them. `RunError.code` is NO_DATA for now; prompt 11 adds NO_MINUTE_DATA.
+- Metrics are grouped as `{"strategy": {...}, "benchmark": {...}}` and tables as `{"strategy": {"annual": [...], "monthly": [...]}, "benchmark": {...}}`; flags as `{flag: detail}`.
+- **For prompt 9:** `run_backtest(config, data, taxes, strategy)` takes a factory from `RunData` to `Targets` or an `OrderStrategy`; `RunData.aligned` holds the adjusted bars (`adj_*`) from the warm-up on, `RunData.rf` the DTB3 rate per bar, and `RunData.start` the first trading bar.

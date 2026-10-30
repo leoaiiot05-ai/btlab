@@ -28,6 +28,7 @@ from btlab.records import (
     RiskFreeRates,
     ShortSuspension,
     SymbolInfo,
+    Trade,
 )
 from btlab.store import MinuteStore, Store, StoreError
 
@@ -308,19 +309,6 @@ ORDER = {
 # Each case inserts its parents first; the last row is the one that must round-trip.
 RAW_ROWS = {
     "rules": [("rules", {"id": 1, "name": "breakout", "body": '{"version": 1}', "updated_at": ISO})],
-    "backtests": [("backtests", BACKTEST)],
-    "backtest_series": [
-        ("backtests", BACKTEST),
-        ("backtest_series", {"backtest_id": 1, "kind": "EQUITY", "values_blob": struct.pack("<2d", 1.0, 2.5)}),
-    ],
-    "trades": [
-        ("backtests", BACKTEST),
-        ("trades", {
-            "backtest_id": 1, "seq": 1, "symbol": "SPY", "side": "LONG", "quantity": 10.0, "entry_time": 20000,
-            "entry_price": 500.25, "exit_time": 20010, "exit_price": 510.5, "pnl": 100.25, "return_pct": 2.05,
-            "costs": 2.0, "exit_reason": "SIGNAL",
-        }),
-    ],
     "optimizations": [("optimizations", {
         "id": 1, "created_at": ISO, "name": "grid", "market": "TW", "mode": "WFO", "status": "DONE",
         "config": '{"market": "TW"}', "results": "[]", "best": '{"fast": 20}', "flags": "[]",
@@ -341,7 +329,7 @@ RAW_ROWS = {
 # The tables whose rows round-trip through access functions below.
 ACCESS_TABLES = {
     "symbols", "lists", "list_members", "daily_bars", "actions", "trading_days", "short_suspensions", "rf_rates",
-    "external_series", "contracts", "job_runs", "settings", "events",
+    "external_series", "contracts", "job_runs", "settings", "events", "backtests", "backtest_series", "trades",
 }
 
 
@@ -804,3 +792,35 @@ def test_purge_deletes_only_that_symbols_data(store, minute_store):
     assert len(store.short_suspensions("2317")) == 1 and store.contract("TW", "2317") is not None
     assert len(minute_store.minute_coverage("TW", "2317")) == 1 and len(minute_store.minute_bars("TW", "2317").t) == 1
     assert store.lists()[0].symbols == ("2330", "2317")
+
+
+# ----- backtest results (§17.5); the full round trip is in test_backtest.py -----
+
+
+def test_a_backtest_round_trips_with_its_series_and_trades(store):
+    trades = [Trade("SPY", "LONG", 10.0, 20000, 500.25, 20010, 510.5, 100.25, 2.05, 2.0, "SIGNAL"),
+              Trade("SPY", "SHORT", 5.0, 20011, 511.0, 20012, 512.0, -6.0, -0.23, 1.0, "OPEN")]
+    series = {"TIME": np.array([20000.0, 20001.0]), "EQUITY": np.array([1e5, math.nan])}
+    saved = store.save_backtest(T0, "MA cross", "US", "1d", {"market": "US"}, {"SPY": {"bar": "2024-10-04"}},
+                                {"strategy": {"sharpe": None}}, {"strategy": {"annual": []}}, {"SURVIVORSHIP": None}, series, trades)
+    row = store.backtest(saved)
+    assert (row.id, row.created_at, row.name, row.market, row.timeframe, row.keep_offline, row.opened_at) == (
+        saved, T0, "MA cross", "US", "1d", False, None)
+    assert (row.config, row.data_stamp, row.metrics, row.tables, row.flags) == (
+        {"market": "US"}, {"SPY": {"bar": "2024-10-04"}}, {"strategy": {"sharpe": None}}, {"strategy": {"annual": []}},
+        {"SURVIVORSHIP": None})
+    read = store.backtest_series(saved)
+    assert read["TIME"].tolist() == [20000.0, 20001.0] and read["EQUITY"][0] == 1e5 and math.isnan(read["EQUITY"][1])
+    assert store.backtest_trades(saved) == trades
+    assert store.backtest(saved + 1) is None and store.backtest_series(saved + 1) == {} and store.backtest_trades(saved + 1) == []
+
+
+@pytest.mark.parametrize(
+    "series, metrics",
+    [({"DRAWDOWN": np.zeros(2)}, {}), ({"TIME": np.zeros(2)}, {"sharpe": math.nan})],
+    ids=["unknown series", "a NaN metric"],
+)
+def test_an_invalid_result_is_refused_and_writes_nothing(store, series, metrics):
+    with pytest.raises(ValueError):
+        store.save_backtest(T0, "x", "US", "1d", {}, {}, metrics, {}, {}, series, [])
+    assert store._db.execute("SELECT COUNT(*) FROM backtests").fetchone()[0] == 0
