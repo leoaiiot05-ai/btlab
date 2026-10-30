@@ -58,7 +58,8 @@ CODES = {
     "event": EVENT_KINDS,
     "level": EVENT_LEVELS,
     "flag": backtest.FLAGS,
-    "error": raised_codes(web, "ApiError") | set(web.HTTP_CODES.values()) | raised_codes(optimize, "OptimizeError"),
+    "error": (raised_codes(web, "ApiError") | set(web.HTTP_CODES.values()) | raised_codes(optimize, "OptimizeError")
+              | raised_codes(jobs, "LiveError")),
     "rule": rules.ISSUE_CODES,
     "fetch": [code for code in SOURCE_ERROR_CODES if code != "HTTP_"] + ["HTTP"],
     "outcome": jobs.OUTCOMES,

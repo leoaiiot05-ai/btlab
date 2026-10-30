@@ -23,6 +23,11 @@ TEXTS = {
                "The scheduled {market} update failed, and failed again in each of its 3 retries.\nLast error: {error}"),
         "zh-TW": ("{market} 資料更新失敗", "排程的 {market} 資料更新失敗，3 次重試也都失敗。\n最後的錯誤：{error}"),
     },
+    "BATCH_READY": {
+        "en": ("{market} batch ready for {session}",
+               "A {market} batch with {lines} lines waits for your confirmation before {cutoff}."),
+        "zh-TW": ("{market} 委託批次待確認（{session}）", "{market} 有一批 {lines} 筆的委託待確認，截止時間 {cutoff}。"),
+    },
     "INTERNAL_ERROR": {
         "en": ("internal error",
                "btlab met an unexpected error: {error}\nDetails are in logs/btlab.log. Later errors of this run send no email."),

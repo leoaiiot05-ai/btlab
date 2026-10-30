@@ -8,39 +8,47 @@ Store reads and writes that may take a while run in threads, so the event loop s
 import asyncio
 import ctypes
 import logging
+import math
 import sys
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import aiohttp
+import numpy as np
 
 from btlab import finmind, fred, tiingo
-from btlab.backtest import (RunConfig, RunError, load_run, lookahead, run_backtest, save_result, stored_series,
-                            strategy_factory, validate_config)
-from btlab.config import ScheduleConfig, ServiceConfig
+from btlab.backtest import (BacktestResult, RunConfig, RunConfigError, RunError, cost_model, load_run, lookahead,
+                            run_backtest, save_result, stored_series, strategy_factory, validate_config)
+from btlab.calendar import next_session
+from btlab.config import OrdersConfig, ScheduleConfig, ServiceConfig
 from btlab.finmind import FinMindClient
 from btlab.fred import FredClient
 from btlab.http import RequestBudget, Requester, SourceError, fetch_start, redact
 from btlab.ib_link import IbError, IbLink
+from btlab.live import (Bar, Book, batch_lines, corporate_actions, cutoff, fill_price, live_lot, replay_targets, settle,
+                        target_weights)
 from btlab.markets import MARKETS, category_by_rule
 from btlab.notifier import Notifier, Silent
 from btlab.optimize import NeedsConfirmation, OptimizeError, PoolFactory, Request, optimize, parse_request
 from btlab.plugins import Plugin
 from btlab.prices import ActionIssue, normalize_minutes, normalize_tw_actions, normalize_us_actions, share_ratio_after
-from btlab.records import Action, Contract, DailyBars, ExternalSnapshot, MinuteBars, MinuteCoverage, to_date, to_day
+from btlab.records import (Action, BacktestRow, Contract, DailyBars, ExternalSnapshot, LedgerRow, Line, LiveBatch, LiveOrder,
+                           LivePortfolio, MinuteBars, MinuteCoverage, to_date, to_day)
 from btlab.scheduler import due_updates, exhausted
 from btlab.spylead_client import SOURCE as SPYLEAD, SpyleadClient
-from btlab.store import MinuteStore, Store
+from btlab.store import MinuteStore, Store, StoreError
 from btlab.taxes import TaxTable
 from btlab.tiingo import TiingoClient
 
 LANES = {"UPDATE_US": "DATA", "UPDATE_TW": "DATA", "SPYLEAD_SNAPSHOT": "DATA", "MINUTE_BACKFILL": "MINUTE",
-         "BACKTEST": "COMPUTE", "OPTIMIZE": "COMPUTE"}
+         "BACKTEST": "COMPUTE", "OPTIMIZE": "COMPUTE", "LIVE_GENERATE": "LIVE", "LIVE_VIRTUAL_FILL": "LIVE"}
+# The replay's and the benchmark's curves of a live portfolio, from its last batch (§14.6).
+CURVES_KEY = "live_curves/{portfolio}"
 # data_start: 30 years plus one year of indicator warm-up (§4.1).
 DATA_YEARS = 31
 TIINGO_SYMBOL_WARNING = 450
@@ -54,7 +62,7 @@ _END_EVENTS = {
     # §18 has no kind of its own for an optimization that waits for the owner's confirmation.
     "NEEDS_CONFIRMATION": ("INFO", "JOB_CANCELLED"),
 }
-_SAVED_EVENTS = {"BACKTEST": "BACKTEST_SAVED", "OPTIMIZE": "OPTIMIZATION_SAVED"}
+_SAVED_EVENTS = {"BACKTEST": "BACKTEST_SAVED", "OPTIMIZE": "OPTIMIZATION_SAVED", "LIVE_GENERATE": "BATCH_PROPOSED"}
 # What a job's progress and record show; the UI localizes each.
 PHASES = ("CALENDAR", "INFO", "BARS", "ACTIONS", "RATES", "SNAPSHOT", "CONNECT", "MINUTES", "LOAD", "CHECK", "SIMULATE",
           "SAVE")
@@ -71,6 +79,14 @@ class Keys:
     tiingo: str = field(repr=False)
     finmind: str = field(repr=False)
     fred: str = field(repr=False)
+
+
+class LiveError(Exception):
+    """A live request the state of the portfolio refuses; code is the API's (§19)."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
 
 
 class JobRunning(Exception):
@@ -90,8 +106,9 @@ class Job:
     whether it goes on: an optimization's NeedsConfirmation, or None."""
 
     def __init__(self, kind: str, started_at: datetime, sleep: Callable[[float], Awaitable[None]],
-                 scheduled_for: datetime | None = None) -> None:
+                 scheduled_for: datetime | None = None, market: str | None = None) -> None:
         self.kind, self.lane, self.started_at, self.scheduled_for = kind, LANES[kind], started_at, scheduled_for
+        self.market = market
         self.phase: str | None = None
         self.done = self.total = 0
         self.item: str | None = None
@@ -179,11 +196,12 @@ class Jobs:
         notifier: Notifier | None = None, session: Callable[[], Any] = aiohttp.ClientSession,
         clock: Callable[[], float] = time.time, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         keep_awake: KeepAwake | None = None, spylead: ServiceConfig = ServiceConfig("", ""),
-        ib: IbLink | None = None, backfill_years: int = 3,
+        ib: IbLink | None = None, backfill_years: int = 3, mode: str = "test",
+        orders: OrdersConfig = OrdersConfig("MOO", 1.0, 3.0),
     ) -> None:
         self.store, self.minute_store, self.keys, self.taxes = store, minute_store, keys, taxes
         self.plugins, self.pool, self.workers, self.spylead = plugins, pool, workers, spylead
-        self.ib, self.backfill_years = ib, backfill_years
+        self.ib, self.backfill_years, self.mode, self.orders = ib, backfill_years, mode, orders
         self.notifier = notifier or Silent()
         self.session, self.clock, self.sleep = session, clock, sleep
         self.keep_awake = keep_awake or KeepAwake()
@@ -195,7 +213,7 @@ class Jobs:
 
     def update(self, market: str, scheduled_for: datetime | None = None) -> Job:
         """UPDATE_US or UPDATE_TW (§17.2); scheduled_for is the due time a scheduled update answers."""
-        return self._start(f"UPDATE_{market}", lambda job: _Update(self, job, market).run(), scheduled_for)
+        return self._start(f"UPDATE_{market}", lambda job: _Update(self, job, market).run(), scheduled_for, market)
 
     def snapshot(self) -> Job:
         """SPYLEAD_SNAPSHOT (§5.6), on the DATA lane."""
@@ -205,6 +223,61 @@ class Jobs:
         """MINUTE_BACKFILL (§17.3) of one market's minute symbols, or of both markets'. Needs ib."""
         markets = tuple(MARKETS) if market is None else (market,)
         return self._start("MINUTE_BACKFILL", lambda job: _Backfill(self, job, markets).run())
+
+    def generate(self, market: str) -> Job:
+        """LIVE_GENERATE (§14.2) for the market's active portfolio of the run mode."""
+        return self._start("LIVE_GENERATE", lambda job: _Generate(self, job, market).run(), market=market)
+
+    def virtual_fill(self, market: str) -> Job:
+        """LIVE_VIRTUAL_FILL (§14.5) for the market's active test-mode portfolio."""
+        return self._start("LIVE_VIRTUAL_FILL", lambda job: _VirtualFill(self, job, market).run(), market=market)
+
+    def create_portfolio(self, backtest: BacktestRow, capital: float | None) -> int:
+        """A portfolio following a saved daily backtest from the next session (§14.1). LiveError NOT_DAILY or
+        ALREADY_EXISTS."""
+        if backtest.timeframe != "1d":
+            raise LiveError("NOT_DAILY", "live portfolios follow daily backtests only")
+        market = backtest.market
+        first_day = self.next_session(market)
+        try:
+            return self.store.create_portfolio(market, self.mode, backtest.id, backtest.config,
+                                               backtest.config["initial_capital"] if capital is None else capital,
+                                               self.now(), first_day)
+        except StoreError as error:
+            if not error.conflict:
+                raise
+            raise LiveError("ALREADY_EXISTS", f"{market} already has an active {self.mode}-mode portfolio") from None
+
+    def regenerate(self, portfolio: LivePortfolio) -> Job:
+        """A new batch now (§14.3); LiveError BATCH_LOCKED once the next session's batch is confirmed."""
+        latest = self.store.batches(portfolio.id, 1)
+        if latest and latest[0].status != "PROPOSED" and latest[0].session_day >= self.next_session(portfolio.market):
+            raise LiveError("BATCH_LOCKED", f"batch {latest[0].id} is {latest[0].status} and is never changed")
+        return self.generate(portfolio.market)
+
+    def confirm(self, batch: LiveBatch, market: str, lines: Collection[int]) -> None:
+        """The owner's confirmation in test mode (§14.4, §14.5): the chosen lines become VIRTUAL_PENDING and the
+        others SKIPPED_OWNER. LiveError BATCH_EXPIRED unless the batch is PROPOSED and before its cutoff."""
+        if batch.status != "PROPOSED" or self.now() >= cutoff(market, batch.session_day):
+            raise LiveError("BATCH_EXPIRED", f"batch {batch.id} can no longer be confirmed")
+        self.store.confirm_batch(batch.id, lines, "VIRTUAL_PENDING", self.now())
+        chosen = sum(line.status == "PROPOSED" and line.id in lines for line in batch.lines)
+        self.event("INFO", "BATCH_CONFIRMED", f"batch {batch.id} confirmed with {chosen} lines", market)
+
+    def expire(self) -> None:
+        """A PROPOSED batch whose cutoff passed is EXPIRED (§14.4, §17.4)."""
+        now = self.now()
+        for batch in self.store.batches_with_status("PROPOSED"):
+            market = self.store.portfolio(batch.portfolio_id).market
+            if now >= cutoff(market, batch.session_day):
+                self.store.set_batch_status(batch.id, "EXPIRED")
+                self.event("INFO", "BATCH_EXPIRED", f"batch {batch.id} for {to_date(batch.session_day)} expired unconfirmed",
+                           market)
+
+    def next_session(self, market: str) -> int:
+        """The session after the latest stored one (§4.3, §14.3)."""
+        stored = self.store.daily_bars("US", "SPY").day if market == "US" else self.store.trading_days(market)
+        return next_session(stored, self.store.market_last_day(market) or int(stored[-1]))
 
     def permission(self, market: str) -> str | None:
         """OK or NO_PERMISSION as IB last answered for the market's minute bars, or None (§5.4)."""
@@ -252,7 +325,9 @@ class Jobs:
         await asyncio.gather(*(job.task for job in jobs))
 
     def tick(self, schedule: ScheduleConfig) -> Job | None:
-        """Starts the first scheduled update that is due (§17.4); a due update waits while the DATA lane is busy."""
+        """Expires batches past their cutoff, then starts the first scheduled update that is due (§17.4); a due update
+        waits while the DATA lane is busy."""
+        self.expire()
         if not schedule.enabled or "DATA" in self._jobs:
             return None
         runs = {market: self.store.latest_job_runs(f"UPDATE_{market}", RUNS_SEEN) for market in MARKETS}
@@ -266,11 +341,11 @@ class Jobs:
         self.store.append_event(self.now(), level, kind, message, market, symbol)
 
     def _start(self, kind: str, work: Callable[[Job], Awaitable[tuple[str, str | None]]],
-               scheduled_for: datetime | None = None) -> Job:
+               scheduled_for: datetime | None = None, market: str | None = None) -> Job:
         lane = LANES[kind]
         if lane in self._jobs:
             raise JobRunning(lane)
-        job = Job(kind, self.now(), self.sleep, scheduled_for)
+        job = Job(kind, self.now(), self.sleep, scheduled_for, market)
         self._jobs[lane] = job
         self.keep_awake.hold()
         job.task = asyncio.get_running_loop().create_task(self._run(job, work))
@@ -279,7 +354,7 @@ class Jobs:
     async def _run(self, job: Job, work: Callable[[Job], Awaitable[tuple[str, str | None]]]) -> None:
         """Runs a job and records its end, whatever happens (§17.1, §23)."""
         run_id = self.store.start_job_run(job.lane, job.kind, job.started_at, job.scheduled_for)
-        market = job.kind.removeprefix("UPDATE_") if job.kind.startswith("UPDATE_") else None
+        market = job.market
         try:
             outcome, message = await work(job)
         except _Stopped:
@@ -288,6 +363,9 @@ class Jobs:
             outcome, message = "FAILED", str(error)
         except (RunError, OptimizeError) as error:
             outcome, message = "FAILED", f"{error.code}: {error}"
+        except RunConfigError as error:
+            # A live portfolio's stored configuration no longer validates, say a plugin was removed.
+            outcome, message = "FAILED", f"INVALID_FIELD: {error}"
         except Exception as error:
             log.exception("%s failed", job.kind)
             outcome, message = "FAILED", redact(f"{type(error).__name__}: {error}")
@@ -301,21 +379,34 @@ class Jobs:
         self.store.finish_job_run(run_id, self.now(), outcome, message)
         level, kind = ("INFO", _SAVED_EVENTS[job.kind]) if outcome == "DONE" else _END_EVENTS[outcome]
         self.event(level, kind, f"{job.kind} {outcome}" + (f": {message}" if message else ""), market)
-        if market is not None and outcome in ("UPDATED", "PARTIAL"):
+        if job.kind.startswith("UPDATE_") and outcome in ("UPDATED", "PARTIAL"):
             self._follow_up(market)
+        if job.kind == "LIVE_VIRTUAL_FILL" and outcome in ("UPDATED", "UP_TO_DATE"):
+            self._live(self.generate, market)
         if outcome == "FAILED" and job.scheduled_for is not None:
             if exhausted(self.store.latest_job_runs(job.kind, RUNS_SEEN), job.scheduled_for):
                 await self.notifier.send("UPDATE_FAILED", market=market, error=message)
 
     def _follow_up(self, market: str) -> None:
-        """After a market's update (§17.2): IB may be asked again for its minute bars (§5.4), and a backfill fetches
-        the new sessions; a running one picks them up after its pause."""
+        """After a market's update (§17.2): the virtual fills of the session just stored, then a new batch (test mode);
+        and the minute bars: IB may be asked again (§5.4), and a backfill fetches the new sessions, or a running one
+        picks them up after its pause."""
+        # Trade mode builds its batches from IB's positions, which come with the order adapter (§14.2, §15).
+        if self.mode == "test" and self.store.active_portfolio(market, self.mode) is not None:
+            self._live(self.virtual_fill, market)
         if self.ib is None:
             return
         if self.permission(market) == "NO_PERMISSION":
             self.store.save_setting(PERMISSION_KEY.format(market=market), None)
         if "MINUTE" not in self._jobs:
             self.backfill()
+
+    def _live(self, start: Callable[[str], Job], market: str) -> None:
+        """A live follow-up; a busy LIVE lane leaves it to the next update or a regenerate."""
+        if "LIVE" in self._jobs:
+            log.warning("LIVE lane busy: no %s follow-up for %s", start.__name__, market)
+            return
+        start(market)
 
     async def _snapshot(self, job: Job) -> tuple[str, str]:
         async with self.session() as session:
@@ -330,14 +421,14 @@ class Jobs:
         job.begin("CHECK")
         suspect = await job.race(asyncio.to_thread(lookahead, config, data, strategy))
         job.begin("SIMULATE")
-        result = await job.race(self._in_pool(run_backtest, config, data, self.taxes, strategy, False))
+        result = await job.race(self.in_pool(run_backtest, config, data, self.taxes, strategy, False))
         if suspect is not None:
             result = replace(result, flags={**result.flags, "LOOKAHEAD_SUSPECT": suspect})
         job.begin("SAVE")
         backtest_id = await asyncio.to_thread(save_result, self.store, result, self.now())
         return "DONE", f"saved as backtest {backtest_id}"
 
-    async def _in_pool(self, function: Callable, *args: Any) -> Any:
+    async def in_pool(self, function: Callable, *args: Any) -> Any:
         """function(*args) in a worker of the pool; when the job stops, a running worker finishes alone."""
         executor = self.pool(initializer=None, initargs=())
         try:
@@ -701,6 +792,159 @@ class _Backfill:
             now = self.jobs.clock()
             end = datetime.fromtimestamp(now + (now - started) / self.job.done * left, TAIPEI)
             self.job.message = f"ends about {end:%H:%M}"
+
+
+def virtual_book(store: Store, portfolio: LivePortfolio) -> Book:
+    """A test-mode portfolio's virtual book: its holdings and the cash of its last ledger row, or the capital before its
+    first (§14.5)."""
+    ledger = store.ledger(portfolio.id)
+    return Book(ledger[-1].cash if ledger else portfolio.capital, store.holdings(portfolio.id))
+
+
+class _Generate:
+    """LIVE_GENERATE (§14.2): the stored configuration replayed through the latest session, its targets scaled to the
+    live equity, and a PROPOSED batch for the next session. The replay's and the benchmark's curves are kept for the
+    chart (§14.6)."""
+
+    def __init__(self, jobs: Jobs, job: Job, market: str) -> None:
+        self.jobs, self.job, self.market = jobs, job, market
+
+    async def run(self) -> tuple[str, str]:
+        jobs, market = self.jobs, self.market
+        portfolio = jobs.store.active_portfolio(market, jobs.mode)
+        if portfolio is None:
+            return "UP_TO_DATE", "no active portfolio"
+        self.job.begin("LOAD")
+        latest = jobs.store.market_last_day(market)
+        missing = [s for s in portfolio.config["symbols"] if (jobs.store.daily_bar_range(market, s) or (0, 0))[1] < latest]
+        if missing:
+            # A bar, or a no-trade day, on the latest session for every symbol (§17.2).
+            message = f"no bar on {to_date(latest)} for {', '.join(missing)}; the next update tries again"
+            jobs.event("WARNING", "LIVE_DATA_INCOMPLETE", message, market)
+            return "FAILED", f"LIVE_DATA_INCOMPLETE: {message}"
+        plugins = jobs.plugins()
+        config = validate_config({**portfolio.config, "end": None}, plugins, stored_series(jobs.store))
+        data = await self.job.race(asyncio.to_thread(load_run, jobs.store, jobs.minute_store, config))
+        self.job.begin("SIMULATE")
+        replay = await self.job.race(jobs.in_pool(run_backtest, config, data, jobs.taxes, strategy_factory(config, plugins), False))
+        self.job.begin("SAVE")
+        return await self._batch(portfolio, config, data, replay)
+
+    async def _batch(self, portfolio: LivePortfolio, config: RunConfig, data: Any, replay: BacktestResult) -> tuple[str, str]:
+        jobs, market = self.jobs, self.market
+        aligned = data.aligned
+        raw = _last_closes(aligned.symbols, aligned.close)
+        # The replay's weights are on its own valuation, raw or adjusted like its equity (§10.2).
+        valued = raw if config.price_mode == "REALISTIC" else _last_closes(aligned.symbols, aligned.adj_close)
+        targets = replay_targets(replay.holdings, replay.pending)
+        weights = target_weights(targets, {s: valued[s] or 0.0 for s in targets}, float(replay.curve.equity[-1]))
+        book = virtual_book(jobs.store, portfolio)
+        lots ={s: live_lot(market, _size_increment(jobs.store.contract(market, s))) for s in config.symbols}
+        session_day = jobs.next_session(market)
+        offset = jobs.orders.us_limit_offset_pct if market == "US" else jobs.orders.tw_limit_offset_pct
+        equity = book.equity({s: close for s, close in raw.items() if close is not None})
+        lines = batch_lines(market, weights, raw, book.holdings, equity, lots, session_day, jobs.orders.us_order_kind, offset)
+        batch_id = jobs.store.save_batch(portfolio.id, session_day, jobs.now(), book.holdings, lines)
+        jobs.store.save_setting(CURVES_KEY.format(portfolio=portfolio.id), _curves(replay, portfolio.first_day))
+        proposed = sum(line.status == "PROPOSED" for line in lines)
+        await jobs.notifier.send("BATCH_READY", market=market, session=to_date(session_day).isoformat(),
+                                 cutoff=f"{cutoff(market, session_day):%Y-%m-%d %H:%M %Z}", lines=str(proposed))
+        return "DONE", f"batch {batch_id} for {to_date(session_day)}: {proposed} lines, {len(lines) - proposed} skipped"
+
+
+class _VirtualFill:
+    """LIVE_VIRTUAL_FILL (§14.5, §14.6): each stored session from the portfolio's first, or after its last ledger row:
+    corporate actions at the open, the fills of the lines confirmed for that session, and the ledger row at the close.
+    Confirmed lines whose session brought no bar expire."""
+
+    def __init__(self, jobs: Jobs, job: Job, market: str) -> None:
+        self.jobs, self.job, self.market = jobs, job, market
+
+    async def run(self) -> tuple[str, str]:
+        jobs = self.jobs
+        portfolio = jobs.store.active_portfolio(self.market, "test")
+        if portfolio is None:
+            return "UP_TO_DATE", "no active portfolio"
+        self.job.begin("LOAD")
+        config = validate_config({**portfolio.config, "end": None}, jobs.plugins(), stored_series(jobs.store))
+        data = await self.job.race(asyncio.to_thread(load_run, jobs.store, jobs.minute_store, config))
+        ledger = jobs.store.ledger(portfolio.id)
+        aligned = data.aligned
+        rows = np.flatnonzero(aligned.days >= (ledger[-1].day + 1 if ledger else portfolio.first_day))
+        if not len(rows):
+            return "UP_TO_DATE", "no new session"
+        costs = cost_model(config, data.categories, data.borrow_fee_pct, jobs.taxes)
+        confirmed = [batch for batch in jobs.store.batches_with_status("CONFIRMED") if batch.portfolio_id == portfolio.id]
+        book, counts = virtual_book(jobs.store, portfolio), Counter()
+        self.job.begin("SAVE", len(rows))
+        for row in rows.tolist():
+            book, fills, done = _session(book, confirmed, aligned, row, costs, config.dividend_withholding_pct)
+            confirmed = [batch for batch in confirmed if batch.id not in done]
+            prices = _last_closes(aligned.symbols, aligned.close[:row + 1])
+            ledger_row = LedgerRow(int(aligned.days[row]), book.cash, book.equity(prices), dict(book.holdings))
+            jobs.store.save_session(portfolio.id, ledger_row, fills, done, jobs.now())
+            counts.update(status for _, status, *_ in fills)
+            self.job.done += 1
+        return "UPDATED", f"sessions {len(rows)}, filled {counts['FILLED']}, expired {counts['EXPIRED']}"
+
+
+def _session(book: Book, confirmed: list[LiveBatch], aligned: Any, row: int, costs: Any,
+             withholding_pct: float) -> tuple[Book, list[tuple], list[int]]:
+    """One session of the virtual book: the corporate actions at the open, then the fills of the lines confirmed for
+    it; returns the book, each line's (id, status, quantity, price, costs) and the batches that ended."""
+    day, symbols = int(aligned.days[row]), aligned.symbols
+    before = _last_closes(symbols, aligned.close[:row])
+    book = corporate_actions(book, {s: float(aligned.ratio[row, j]) for j, s in enumerate(symbols)},
+                             {s: float(aligned.cash[row, j]) for j, s in enumerate(symbols)}, before, withholding_pct)
+    fills, done = [], []
+    for batch in confirmed:
+        if batch.session_day > day:
+            continue
+        for order in batch.lines:
+            if order.status != "VIRTUAL_PENDING":
+                continue
+            j = symbols.index(order.symbol)
+            line = _trading_line(order, float(aligned.ratio[row, j]))
+            bar = Bar(*(float(getattr(aligned, name)[row, j]) for name in ("open", "high", "low", "close")),
+                      bool(aligned.tradable[row, j]), int(aligned.lock[row, j]))
+            # A batch whose session brought no bar, a holiday, expires: day orders never carry over (§14.5).
+            price = fill_price(line, bar) if batch.session_day == day else None
+            if price is None:
+                fills.append((order.id, "EXPIRED", 0.0, None, None))
+                continue
+            book, paid, charge = settle(book, line, price, costs, j, day)
+            fills.append((order.id, "FILLED", line.quantity, paid, charge))
+        done.append(batch.id)
+    return book, fills, done
+
+
+def _trading_line(order: LiveOrder, ratio: float) -> Line:
+    """A confirmed line as it trades on its session: a share ratio that day scales its quantity and prices (§10.7)."""
+    limit = None if order.limit_price is None else order.limit_price / ratio
+    return Line(order.symbol, order.action, float(math.trunc(order.quantity * ratio)), order.kind, limit,
+                order.ref_price / ratio, order.status)
+
+
+def _last_closes(symbols: tuple[str, ...], values: np.ndarray) -> dict[str, float | None]:
+    """Each symbol's latest close, carried over a no-trade day; None without any."""
+    found = {}
+    for j, symbol in enumerate(symbols):
+        known = np.flatnonzero(np.isfinite(values[:, j]))
+        found[symbol] = float(values[known[-1], j]) if len(known) else None
+    return found
+
+
+def _size_increment(contract: Contract | None) -> float | None:
+    return None if contract is None else contract.size_increment
+
+
+def _curves(replay: BacktestResult, first_day: int) -> dict:
+    """The replay's equity and its benchmark from the session before the portfolio's first (§14.6)."""
+    days = replay.series["TIME"].astype(np.int64)
+    first = max(0, int(np.searchsorted(days, first_day)) - 1)
+    return {"t": days[first:].tolist(),
+            **{name: [None if not math.isfinite(v) else float(v) for v in replay.series[kind][first:]]
+               for name, kind in (("replay", "EQUITY"), ("benchmark", "BENCHMARK"))}}
 
 
 def _years_before(day: date, years: int) -> date:

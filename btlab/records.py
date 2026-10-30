@@ -267,6 +267,84 @@ class BacktestRow:
 
 
 @dataclass(frozen=True)
+class LivePortfolio:
+    """A live portfolio (§14.1): its source backtest's configuration, copied at creation, and the capital it trades from
+    first_day, the first session it trades."""
+
+    id: int
+    market: str
+    mode: str
+    backtest_id: int | None
+    config: dict
+    capital: float
+    created_at: datetime
+    first_day: int
+    active: bool
+
+
+@dataclass(frozen=True)
+class Line:
+    """A line as a batch proposes it (§14.2): status is PROPOSED, or a skip kept with its reason and never traded."""
+
+    symbol: str
+    action: str
+    quantity: float
+    kind: str
+    limit_price: float | None
+    ref_price: float
+    status: str
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveOrder:
+    """One line of a batch (§14.2, §18): what it trades, its state, and its fill."""
+
+    id: int
+    batch_id: int
+    line: int
+    symbol: str
+    con_id: int | None
+    action: str
+    quantity: float
+    kind: str
+    limit_price: float | None
+    ref_price: float
+    status: str
+    reason: str | None
+    order_ref: str | None
+    ib_order_id: int | None
+    filled_qty: float
+    avg_price: float | None
+    commission: float | None
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class LiveBatch:
+    """A batch for one session (§14.3, §14.4), with the holdings it was built on and its lines in order."""
+
+    id: int
+    portfolio_id: int
+    session_day: int
+    created_at: datetime
+    status: str
+    confirmed_at: datetime | None
+    positions_seen: dict
+    lines: tuple[LiveOrder, ...]
+
+
+@dataclass(frozen=True)
+class LedgerRow:
+    """A portfolio's book at a session close (§14.6)."""
+
+    day: int
+    cash: float
+    equity: float
+    holdings: dict
+
+
+@dataclass(frozen=True)
 class OptimizationRow:
     """A saved optimization (§13.7, §18); config, results, best and flags are JSON. Listings leave results out
     (None)."""

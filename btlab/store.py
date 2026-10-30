@@ -9,7 +9,7 @@ import logging
 import math
 import sqlite3
 import threading
-from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +31,11 @@ from btlab.records import (
     ExternalSeries,
     ExternalSnapshot,
     JobRun,
+    LedgerRow,
+    Line,
+    LiveBatch,
+    LiveOrder,
+    LivePortfolio,
     MinuteBars,
     MinuteCoverage,
     OptimizationRow,
@@ -828,6 +833,122 @@ class Store(_Database):
             cursor = db.execute("DELETE FROM optimizations WHERE id = ?", (optimization_id,))
         return cursor.rowcount == 1
 
+    # ----- live portfolios (§14) -----
+
+    def create_portfolio(self, market: str, mode: str, backtest_id: int | None, config: dict, capital: float,
+                         created_at: datetime, first_day: int) -> int:
+        """StoreError with conflict when the market already has an active portfolio in this run mode (§14.1)."""
+        with self._write() as db:
+            cursor = db.execute(
+                "INSERT INTO live_portfolios (market, mode, backtest_id, config, capital, created_at, first_day)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (market, mode, backtest_id, _json(config), capital, _iso(created_at), first_day),
+            )
+        return cursor.lastrowid
+
+    def portfolios(self, mode: str) -> list[LivePortfolio]:
+        """A run mode's portfolios, active ones and those kept for their history, newest first."""
+        rows = self._read(f"SELECT {_PORTFOLIO_COLUMNS} FROM live_portfolios WHERE mode = ? ORDER BY id DESC", (mode,))
+        return [_portfolio(*row) for row in rows]
+
+    def portfolio(self, portfolio_id: int) -> LivePortfolio | None:
+        rows = self._read(f"SELECT {_PORTFOLIO_COLUMNS} FROM live_portfolios WHERE id = ?", (portfolio_id,))
+        return _portfolio(*rows[0]) if rows else None
+
+    def active_portfolio(self, market: str, mode: str) -> LivePortfolio | None:
+        rows = self._read(f"SELECT {_PORTFOLIO_COLUMNS} FROM live_portfolios WHERE market = ? AND mode = ? AND active = 1",
+                          (market, mode))
+        return _portfolio(*rows[0]) if rows else None
+
+    def deactivate_portfolio(self, portfolio_id: int) -> bool:
+        """It keeps its batches, book and ledger (§14.1)."""
+        with self._write() as db:
+            cursor = db.execute("UPDATE live_portfolios SET active = 0 WHERE id = ? AND active = 1", (portfolio_id,))
+        return cursor.rowcount == 1
+
+    def save_batch(self, portfolio_id: int, session_day: int, created_at: datetime, positions_seen: dict,
+                   lines: Sequence[Line]) -> int:
+        """A new PROPOSED batch with its lines; the portfolio's PROPOSED batch becomes REPLACED in the same transaction
+        (§14.3)."""
+        with self._write() as db:
+            db.execute("UPDATE live_batches SET status = 'REPLACED' WHERE portfolio_id = ? AND status = 'PROPOSED'",
+                       (portfolio_id,))
+            cursor = db.execute(
+                "INSERT INTO live_batches (portfolio_id, session_day, created_at, status, positions_seen)"
+                " VALUES (?, ?, ?, 'PROPOSED', ?)",
+                (portfolio_id, session_day, _iso(created_at), _json(positions_seen)),
+            )
+            batch_id = cursor.lastrowid
+            db.executemany(
+                "INSERT INTO live_orders (batch_id, line, symbol, action, quantity, kind, limit_price, ref_price, status,"
+                " reason, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(batch_id, number, line.symbol, line.action, line.quantity, line.kind, line.limit_price, line.ref_price,
+                  line.status, line.reason, _iso(created_at)) for number, line in enumerate(lines, 1)],
+            )
+        return batch_id
+
+    def batches(self, portfolio_id: int, limit: int) -> list[LiveBatch]:
+        """Newest first, each with its lines."""
+        rows = self._read(f"SELECT {_BATCH_COLUMNS} FROM live_batches WHERE portfolio_id = ? ORDER BY id DESC LIMIT ?",
+                          (portfolio_id, limit))
+        return [self._batch(row) for row in rows]
+
+    def batch(self, batch_id: int) -> LiveBatch | None:
+        rows = self._read(f"SELECT {_BATCH_COLUMNS} FROM live_batches WHERE id = ?", (batch_id,))
+        return self._batch(rows[0]) if rows else None
+
+    def batches_with_status(self, status: str) -> list[LiveBatch]:
+        rows = self._read(f"SELECT {_BATCH_COLUMNS} FROM live_batches WHERE status = ? ORDER BY id", (status,))
+        return [self._batch(row) for row in rows]
+
+    def _batch(self, row: tuple) -> LiveBatch:
+        id_, portfolio_id, session_day, created_at, status, confirmed_at, positions_seen = row
+        lines = self._read(f"SELECT {_ORDER_COLUMNS} FROM live_orders WHERE batch_id = ? ORDER BY line", (id_,))
+        return LiveBatch(id_, portfolio_id, session_day, _moment(created_at), status, _moment(confirmed_at),
+                         json.loads(positions_seen), tuple(_order(*line) for line in lines))
+
+    def set_batch_status(self, batch_id: int, status: str) -> bool:
+        with self._write() as db:
+            cursor = db.execute("UPDATE live_batches SET status = ? WHERE id = ?", (status, batch_id))
+        return cursor.rowcount == 1
+
+    def confirm_batch(self, batch_id: int, chosen: Collection[int], chosen_status: str, confirmed_at: datetime) -> None:
+        """The owner's confirmation (§14.4): chosen PROPOSED lines take chosen_status, the others SKIPPED_OWNER."""
+        stamp = _iso(confirmed_at)
+        with self._write() as db:
+            for order_id, status in db.execute("SELECT id, status FROM live_orders WHERE batch_id = ?", (batch_id,)).fetchall():
+                if status == "PROPOSED":
+                    db.execute("UPDATE live_orders SET status = ?, updated_at = ? WHERE id = ?",
+                               (chosen_status if order_id in chosen else "SKIPPED_OWNER", stamp, order_id))
+            db.execute("UPDATE live_batches SET status = 'CONFIRMED', confirmed_at = ? WHERE id = ?", (stamp, batch_id))
+
+    def holdings(self, portfolio_id: int) -> dict[str, float]:
+        """The virtual book's shares by symbol (test mode, §14.5)."""
+        rows = self._read("SELECT symbol, quantity FROM live_holdings WHERE portfolio_id = ? ORDER BY symbol", (portfolio_id,))
+        return dict(rows)
+
+    def ledger(self, portfolio_id: int) -> list[LedgerRow]:
+        rows = self._read("SELECT day, cash, equity, holdings FROM live_ledger WHERE portfolio_id = ? ORDER BY day",
+                          (portfolio_id,))
+        return [LedgerRow(day, cash, equity, json.loads(holdings)) for day, cash, equity, holdings in rows]
+
+    def save_session(self, portfolio_id: int, row: LedgerRow, fills: Sequence[tuple[int, str, float, float | None, float | None]],
+                     done: Collection[int], updated_at: datetime) -> None:
+        """A session of the virtual book in one transaction (§14.5, §14.6): each line's (id, status, filled quantity,
+        price, costs), the batches all of whose lines ended, the holdings and the ledger row."""
+        stamp = _iso(updated_at)
+        with self._write() as db:
+            db.executemany(
+                "UPDATE live_orders SET status = ?, filled_qty = ?, avg_price = ?, commission = ?, updated_at = ? WHERE id = ?",
+                [(status, quantity, price, costs, stamp, order_id) for order_id, status, quantity, price, costs in fills],
+            )
+            db.executemany("UPDATE live_batches SET status = 'DONE' WHERE id = ?", [(batch_id,) for batch_id in done])
+            db.execute("DELETE FROM live_holdings WHERE portfolio_id = ?", (portfolio_id,))
+            db.executemany("INSERT INTO live_holdings (portfolio_id, symbol, quantity) VALUES (?, ?, ?)",
+                           [(portfolio_id, symbol, quantity) for symbol, quantity in row.holdings.items()])
+            db.execute("INSERT OR REPLACE INTO live_ledger (portfolio_id, day, cash, equity, holdings) VALUES (?, ?, ?, ?, ?)",
+                       (portfolio_id, row.day, row.cash, row.equity, _json(row.holdings)))
+
     # ----- events and job runs (§17.1, §18) -----
 
     def append_event(
@@ -1043,6 +1164,23 @@ def _backtest(id_: int, created_at: str, name: str, market: str, timeframe: str,
         json.loads(metrics), None if tables is None else json.loads(tables), json.loads(flags), bool(keep_offline),
         _moment(opened_at),
     )
+
+
+_PORTFOLIO_COLUMNS = "id, market, mode, backtest_id, config, capital, created_at, first_day, active"
+_BATCH_COLUMNS = "id, portfolio_id, session_day, created_at, status, confirmed_at, positions_seen"
+_ORDER_COLUMNS = ("id, batch_id, line, symbol, con_id, action, quantity, kind, limit_price, ref_price, status, reason,"
+                  " order_ref, ib_order_id, filled_qty, avg_price, commission, updated_at")
+
+
+def _portfolio(id_: int, market: str, mode: str, backtest_id: int | None, config: str, capital: float, created_at: str,
+               first_day: int, active: int) -> LivePortfolio:
+    return LivePortfolio(id_, market, mode, backtest_id, json.loads(config), capital, _moment(created_at), first_day,
+                         bool(active))
+
+
+def _order(*row: Any) -> LiveOrder:
+    *fields, updated_at = row
+    return LiveOrder(*fields, _moment(updated_at))
 
 
 _OPTIMIZATION_COLUMNS = "id, created_at, name, market, mode, status, config, best, flags"

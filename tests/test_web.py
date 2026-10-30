@@ -129,7 +129,7 @@ def api_routes(world) -> list[tuple[str, str]]:
 
 def test_every_api_route_but_login_needs_the_session(world):
     routes = api_routes(world)
-    assert len(routes) == 41
+    assert len(routes) == 48
 
     async def scenario(client):
         return [await answer(await client.request(method, path, json={})) for method, path in routes]
@@ -462,7 +462,8 @@ def test_the_state_document(world):
         return await answer(await client.get("/api/state"))
 
     status, found = serve(world, scenario)
-    assert status == 200 and set(found) == {"app", "markets", "jobs", "events"}
+    assert status == 200 and set(found) == {"app", "markets", "jobs", "live", "events"}
+    assert found["live"] == {"US": None, "TW": None}
     assert found["app"] == {"server_time": "2026-10-28T01:00:00Z", "mode": "test",
                             "keys": {"tiingo": True, "finmind": True, "fred": True},
                             "services": {

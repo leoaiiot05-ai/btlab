@@ -28,14 +28,16 @@ from btlab.builtins import BUILTINS
 from btlab.calendar import session
 from btlab.config import Config
 from btlab.intraday import TIMEFRAME_MINUTES, resample
-from btlab.jobs import PERMISSION_KEY, JobRunning
+from btlab.jobs import CURVES_KEY, PERMISSION_KEY, JobRunning, LiveError, virtual_book
+from btlab.live import cutoff
 from btlab.markets import MARKETS, category_by_rule, normalize_symbol
 from btlab.metrics import drawdown
 from btlab.notifier import Notifier, Silent
 from btlab.optimize import NeedsConfirmation, OptimizeError, combination_config, heatmap
 from btlab.plugins import PluginFolder
 from btlab.prices import adjusted, align, day_events
-from btlab.records import BacktestRow, ExternalSeries, MinuteBars, OptimizationRow, SymbolList, Trade, to_date, to_day
+from btlab.records import (BacktestRow, ExternalSeries, LiveBatch, LivePortfolio, MinuteBars, OptimizationRow, SymbolList,
+                           Trade, to_date, to_day)
 from btlab.registry import operands
 from btlab.rules import validate_rule
 from btlab.scheduler import next_time
@@ -150,6 +152,13 @@ def make_app(services: Services) -> web.Application:
         web.get(r"/api/optimizations/{id:\d+}/heatmap", get_heatmap),
         web.post(r"/api/optimizations/{id:\d+}/promote", promote),
         web.delete(r"/api/optimizations/{id:\d+}", delete_optimization),
+        web.get("/api/live", get_live),
+        web.post("/api/live", create_live),
+        web.delete(r"/api/live/{id:\d+}", delete_live),
+        web.get(r"/api/live/{id:\d+}/curve", get_live_curve),
+        web.get(r"/api/live/{id:\d+}/batches", get_live_batches),
+        web.post(r"/api/live/{id:\d+}/regenerate", regenerate),
+        web.post(r"/api/live/batches/{id:\d+}/confirm", confirm_batch),
         web.get("/{path:.*}", static),
     ])
     return app
@@ -180,6 +189,8 @@ async def _errors(request: web.Request, handler: Callable) -> web.StreamResponse
         return error.response()
     except JobRunning as busy:
         return ApiError(409, "JOB_RUNNING", str(busy)).response()
+    except LiveError as refused:
+        return ApiError(400 if refused.code == "NOT_DAILY" else 409, refused.code, str(refused)).response()
     except web.HTTPException as error:
         if not request.path.startswith("/api/"):
             raise
@@ -338,8 +349,8 @@ async def logout(request: web.Request) -> web.Response:
 
 
 async def state(request: web.Request) -> web.Response:
-    """The state document (§19): the app with its services, the markets, the jobs and the latest events. ibguard and
-    live arrive with their features."""
+    """The state document (§19): the app with its services, the markets, the jobs, each market's live portfolio and
+    the latest events. ibguard arrives with its feature."""
     services = _services(request)
     now = _now(services)
     running = services.jobs.running()
@@ -347,6 +358,7 @@ async def state(request: web.Request) -> web.Response:
         "app": _app_state(services, now),
         "markets": {market: _market_state(services.store, market) for market in MARKETS},
         "jobs": {lane: running.get(lane) for lane in LANES},
+        "live": {market: _live_state(services.store, market, services.config.mode) for market in MARKETS},
         "events": [
             {"id": e.id, "ts": _utc(e.ts), "level": e.level, "kind": e.kind, "market": e.market, "symbol": e.symbol,
              "message": e.message}
@@ -387,6 +399,18 @@ def _spylead(services: Services, series: Callable[[tuple[ExternalSeries, ...]], 
     return {"configured": bool(services.config.spylead.url),
             "snapshot_at": None if snapshot is None else _utc(snapshot.taken_at),
             "series": series(() if snapshot is None else snapshot.series)}
+
+
+def _live_state(store: Store, market: str, mode: str) -> dict | None:
+    """The market's active portfolio in the run mode and its latest batch, with the cutoff to confirm it (§14.4)."""
+    portfolio = store.active_portfolio(market, mode)
+    if portfolio is None:
+        return None
+    latest = store.batches(portfolio.id, 1)
+    batch = latest[0] if latest else None
+    return {"portfolio_id": portfolio.id, "batch": None if batch is None else {
+        "id": batch.id, "status": batch.status, "session": _iso(batch.session_day),
+        "cutoff": _utc(cutoff(market, batch.session_day)), "lines": len(batch.lines)}}
 
 
 def _market_state(store: Store, market: str) -> dict:
@@ -1062,6 +1086,133 @@ async def delete_optimization(request: web.Request) -> web.Response:
     if not _services(request).store.delete_optimization(_id(request)):
         raise ApiError(404, "NOT_FOUND", "no such optimization")
     return web.Response(status=204)
+
+
+# ----- live portfolios (§14) -----
+
+
+async def get_live(request: web.Request) -> web.Response:
+    """The run mode's portfolios: each with its holdings valued at the last close, cash, equity and latest batch."""
+    services = _services(request)
+    return _json([_portfolio(services.store, found) for found in services.store.portfolios(services.config.mode)])
+
+
+def _portfolio(store: Store, found: LivePortfolio) -> dict:
+    book = virtual_book(store, found)
+    prices = {symbol: _last_close(store, found.market, symbol) for symbol in book.holdings}
+    equity = book.equity(prices)
+    latest = store.batches(found.id, 1)
+    return _rounded({
+        "id": found.id, "market": found.market, "mode": found.mode, "backtest_id": found.backtest_id,
+        "name": found.config["name"], "capital": found.capital, "created_at": _utc(found.created_at),
+        "first_day": _iso(found.first_day), "active": found.active, "cash": book.cash, "equity": equity,
+        "holdings": [{"symbol": symbol, "quantity": quantity, "price": prices[symbol], "value": quantity * prices[symbol],
+                      "weight": quantity * prices[symbol] / equity} for symbol, quantity in book.holdings.items()],
+        "batch": _batch(latest[0], found.market) if latest else None,
+    })
+
+
+def _last_close(store: Store, market: str, symbol: str) -> float:
+    close = store.daily_bars(market, symbol).close
+    return float(close[np.isfinite(close)][-1])
+
+
+def _batch(batch: LiveBatch, market: str) -> dict:
+    return {
+        "id": batch.id, "session": _iso(batch.session_day), "status": batch.status, "created_at": _utc(batch.created_at),
+        "confirmed_at": _utc(batch.confirmed_at), "cutoff": _utc(cutoff(market, batch.session_day)),
+        "lines": [{"id": line.id, "line": line.line, "symbol": line.symbol, "action": line.action, "quantity": line.quantity,
+                   "kind": line.kind, "limit_price": line.limit_price, "ref_price": line.ref_price, "status": line.status,
+                   "reason": line.reason, "filled_qty": line.filled_qty, "avg_price": line.avg_price,
+                   "commission": line.commission} for line in batch.lines],
+    }
+
+
+def _live(store: Store, portfolio_id: int) -> LivePortfolio:
+    found = store.portfolio(portfolio_id)
+    if found is None:
+        raise ApiError(404, "NOT_FOUND", "no such live portfolio")
+    return found
+
+
+async def create_live(request: web.Request) -> web.Response:
+    """A portfolio from a saved daily backtest (§14.1): 201; 400 NOT_DAILY; 409 ALREADY_EXISTS."""
+    services = _services(request)
+    body = _object(await read_json(request), ("backtest_id", "capital"))
+    backtest_id, capital = body.get("backtest_id"), body.get("capital")
+    if type(backtest_id) is not int:
+        raise ApiError(400, "INVALID_FIELD", "must be a backtest id", "backtest_id")
+    if capital is not None and (type(capital) not in (int, float) or not capital > 0):
+        raise ApiError(400, "INVALID_FIELD", "must be a number above 0", "capital")
+    portfolio_id = services.jobs.create_portfolio(_backtest(services.store, backtest_id),
+                                                  None if capital is None else float(capital))
+    return _json({"id": portfolio_id}, 201)
+
+
+async def delete_live(request: web.Request) -> web.Response:
+    """204: the portfolio stops and keeps its history (§14.1)."""
+    if not _services(request).store.deactivate_portfolio(_id(request)):
+        raise ApiError(404, "NOT_FOUND", "no such active live portfolio")
+    return web.Response(status=204)
+
+
+async def get_live_curve(request: web.Request) -> web.Response:
+    """The portfolio's equity, the benchmark and the replayed backtest, the last two rescaled to the capital at the
+    session before the first (§14.6)."""
+    store = _services(request).store
+    found = _live(store, _id(request))
+    curves = store.setting(CURVES_KEY.format(portfolio=found.id)) or {"t": [], "replay": [], "benchmark": []}
+    ledger = {row.day: row.equity for row in store.ledger(found.id)}
+    days = sorted(set(curves["t"]) | set(ledger))
+    return _json({"time_unit": "day", "t": days, "series": {
+        "PORTFOLIO": [_round(ledger[day]) if day in ledger else None for day in days],
+        "BENCHMARK": _rescaled(curves["t"], curves["benchmark"], days, found.capital),
+        "REPLAY": _rescaled(curves["t"], curves["replay"], days, found.capital),
+    }})
+
+
+def _rescaled(times: list[int], values: list[float | None], days: list[int], capital: float) -> list[float | None]:
+    if not values or not values[0]:
+        return [None] * len(days)
+    by_day = dict(zip(times, values))
+    return [_round(by_day[day] * capital / values[0]) if by_day.get(day) is not None else None for day in days]
+
+
+async def get_live_batches(request: web.Request) -> web.Response:
+    store = _services(request).store
+    found = _live(store, _id(request))
+    limit = _query_integer(request, "limit", LIST_LIMIT, 1, MAX_LIST_LIMIT)
+    return _json([_rounded(_batch(batch, found.market)) for batch in store.batches(found.id, limit)])
+
+
+async def regenerate(request: web.Request) -> web.Response:
+    """202 with the LIVE_GENERATE job; 409 BATCH_LOCKED once the next session's batch is confirmed, or JOB_RUNNING."""
+    await read_json(request)
+    services = _services(request)
+    found = _live(services.store, _id(request))
+    _test_mode(services)
+    job = services.jobs.regenerate(found)
+    return _json({"lane": job.lane, "kind": job.kind}, 202)
+
+
+async def confirm_batch(request: web.Request) -> web.Response:
+    """The owner's confirmation with the lines kept checked (§14.4): 202; 409 BATCH_EXPIRED."""
+    services = _services(request)
+    lines = _object(await read_json(request), ("lines",)).get("lines")
+    if not isinstance(lines, list) or not all(type(line) is int for line in lines):
+        raise ApiError(400, "INVALID_FIELD", "must be a list of line ids", "lines")
+    batch = services.store.batch(_id(request))
+    if batch is None:
+        raise ApiError(404, "NOT_FOUND", "no such batch")
+    _test_mode(services)
+    services.jobs.confirm(batch, services.store.portfolio(batch.portfolio_id).market, set(lines))
+    return _json({"batch": batch.id, "status": "CONFIRMED"}, 202)
+
+
+def _test_mode(services: Services) -> None:
+    """Trade mode needs IB's positions and orders, which the order adapter brings (§15)."""
+    if services.config.mode != "test":
+        raise ApiError(409, "NOT_CONNECTED", "trade mode cannot build or send batches yet: IB orders are not connected")
 
 
 # ----- static files (§20) -----

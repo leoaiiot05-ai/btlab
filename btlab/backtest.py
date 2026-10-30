@@ -139,7 +139,8 @@ class RunData:
 @dataclass(frozen=True, eq=False)
 class BacktestResult:
     """A run's result (§10.11): the series of §18, the trades, metrics and tables of the strategy and its benchmark,
-    the flags with their details, the data stamp, and the strategy's curve with each point's day and DTB3 rate."""
+    the flags with their details, the data stamp, the strategy's curve with each point's day and DTB3 rate, and the
+    positions after the last close with the pending orders' target quantities, which a live portfolio follows (§14.2)."""
 
     config: dict
     time_unit: str
@@ -150,6 +151,8 @@ class BacktestResult:
     flags: dict
     data_stamp: dict
     curve: Curve
+    holdings: dict[str, float]
+    pending: dict[str, float]
 
 
 StrategyFactory = Callable[[View], "Targets | OrderStrategy"]
@@ -621,7 +624,7 @@ def run_backtest(config: RunConfig, data: RunData, taxes: TaxTable | None, strat
     (§10.9), the metrics of §12 on the daily bars or the session ends (§11.7), the flags and the result. An
     optimization's grid skips the look-ahead check (§9.7); flatten closes every position at the last bar's close,
     with costs, as a walk-forward test window does (§13.5)."""
-    costs = _cost_model(config, data.categories, data.borrow_fee_pct, taxes)
+    costs = cost_model(config, data.categories, data.borrow_fee_pct, taxes)
     settings = _settings(config, costs, data.suspensions)
     timeline, strategy_view, minute, points = _prepare(config, data)
     paths = _minute_paths(config, data) if minute is None else minute.paths(adjusted=config.price_mode == "ADJUSTED")
@@ -665,6 +668,8 @@ def run_backtest(config: RunConfig, data: RunData, taxes: TaxTable | None, strat
         flags=flags,
         data_stamp=data.data_stamp,
         curve=curve,
+        holdings={symbol: float(result.holdings[j]) for j, symbol in enumerate(config.symbols)},
+        pending={config.symbols[j]: target for j, target in result.pending.items()},
     )
 
 
@@ -733,7 +738,7 @@ def minute_view(minute: MinuteRun, data: RunData) -> View:
                 session=timeline.session, daily=Daily(data.aligned.days, _adjusted(data.aligned)), external=data.external)
 
 
-def _cost_model(config: RunConfig, categories: tuple[str, ...], borrow: tuple[float | None, ...], taxes: TaxTable | None) -> CostModel:
+def cost_model(config: RunConfig, categories: tuple[str, ...], borrow: tuple[float | None, ...], taxes: TaxTable | None) -> CostModel:
     us = config.market == "US"
     return CostModel(
         market=config.market, commission_rule=config.commission, slippage_bps=config.slippage_bps,
@@ -787,7 +792,7 @@ def _benchmark(config: RunConfig, data: RunData, taxes: TaxTable | None) -> tupl
     weights = np.full(data.benchmark.close.shape, np.nan)
     if len(known):
         weights[data.start + first, 0] = 1.0
-    costs = _cost_model(config, (data.benchmark_category,), (None,), taxes)
+    costs = cost_model(config, (data.benchmark_category,), (None,), taxes)
     settings = _settings(config, costs, ((),))
     result = simulate(timeline, Targets("WEIGHTS", weights), settings)
     equity = result.equity.copy()
