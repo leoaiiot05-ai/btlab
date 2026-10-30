@@ -6,6 +6,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.cookies import SimpleCookie
 from typing import Any
 
 
@@ -15,6 +16,8 @@ class Call:
     params: dict[str, str]
     headers: dict[str, str]
     timeout: Any
+    method: str = "GET"
+    json: Any = None
 
 
 @dataclass
@@ -33,6 +36,7 @@ class FakeResponse:
     def __init__(self, answer: Answer) -> None:
         self.status = answer.status
         self.headers = answer.headers
+        self.cookies = SimpleCookie(answer.headers.get("Set-Cookie", ""))
         self._body = answer.raw()
 
     async def read(self) -> bytes:
@@ -40,7 +44,7 @@ class FakeResponse:
 
 
 class _Exchange:
-    """What session.get returns: the request happens when the context is entered, as in aiohttp."""
+    """What session.request returns: the request happens when the context is entered, as in aiohttp."""
 
     def __init__(self, outcome: Answer | BaseException) -> None:
         self._outcome = outcome
@@ -55,14 +59,14 @@ class _Exchange:
 
 
 class FakeSession:
-    """Answers GET requests from a script, in order, and records every call. It opens no connection."""
+    """Answers requests from a script, in order, and records every call. It opens no connection."""
 
     def __init__(self, *outcomes: Answer | BaseException) -> None:
         self.outcomes = list(outcomes)
         self.calls: list[Call] = []
 
-    def get(self, url: str, *, params=None, headers=None, timeout=None) -> _Exchange:
-        self.calls.append(Call(url, dict(params or {}), dict(headers or {}), timeout))
+    def request(self, method: str, url: str, *, params=None, json=None, headers=None, timeout=None) -> _Exchange:
+        self.calls.append(Call(url, dict(params or {}), dict(headers or {}), timeout, method, json))
         if not self.outcomes:
             raise AssertionError(f"unexpected request number {len(self.calls)}")
         return _Exchange(self.outcomes.pop(0))

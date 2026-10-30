@@ -23,7 +23,7 @@ from aiohttp import web
 
 import numpy as np
 
-from btlab.backtest import TIMEFRAMES, RunConfigError, equity_csv, trades_csv
+from btlab.backtest import TIMEFRAMES, RunConfigError, equity_csv, stored_series, trades_csv
 from btlab.builtins import BUILTINS
 from btlab.calendar import session
 from btlab.config import Config
@@ -35,7 +35,7 @@ from btlab.notifier import Notifier, Silent
 from btlab.optimize import NeedsConfirmation, OptimizeError, combination_config, heatmap
 from btlab.plugins import PluginFolder
 from btlab.prices import adjusted, align, day_events
-from btlab.records import BacktestRow, MinuteBars, OptimizationRow, SymbolList, Trade, to_date, to_day
+from btlab.records import BacktestRow, ExternalSeries, MinuteBars, OptimizationRow, SymbolList, Trade, to_date, to_day
 from btlab.registry import operands
 from btlab.rules import validate_rule
 from btlab.scheduler import next_time
@@ -119,6 +119,8 @@ def make_app(services: Services) -> web.Application:
         web.patch("/api/symbols/{market}/{symbol}", patch_symbol),
         web.delete("/api/symbols/{market}/{symbol}", delete_symbol),
         web.post("/api/update", update),
+        web.get("/api/spylead", get_spylead),
+        web.post("/api/spylead/snapshot", snapshot),
         web.post("/api/jobs/{lane}/cancel", cancel),
         web.get("/api/strategies", get_strategies),
         web.post("/api/strategies/reload", reload_strategies),
@@ -341,7 +343,7 @@ async def state(request: web.Request) -> web.Response:
     now = _now(services)
     running = services.jobs.running()
     return _json({
-        "app": _app_state(services.config, now),
+        "app": _app_state(services, now),
         "markets": {market: _market_state(services.store, market) for market in MARKETS},
         "jobs": {lane: running.get(lane) for lane in LANES},
         "events": [
@@ -352,18 +354,29 @@ async def state(request: web.Request) -> web.Response:
     })
 
 
-def _app_state(config: Config, now: datetime) -> dict:
+def _app_state(services: Services, now: datetime) -> dict:
     """Whether each key is set, never the key (§19)."""
+    config = services.config
     schedule = config.schedule
     times = {"US": schedule.us_update, "TW": schedule.tw_update}
     return {
         "server_time": _utc(now),
         "mode": config.mode,
         "keys": {"tiingo": bool(config.tiingo.api_key), "finmind": bool(config.finmind.token), "fred": bool(config.fred.api_key)},
+        "services": {"spylead": _spylead(services, len)},
         "limits": None if config.mode == "test" or config.limits is None else asdict(config.limits),
         "schedule": {"enabled": schedule.enabled,
                      "next": {m: _utc(next_time(m, at, now)) for m, at in times.items()} if schedule.enabled else None},
     }
+
+
+def _spylead(services: Services, series: Callable[[tuple[ExternalSeries, ...]], Any]) -> dict:
+    """Whether spylead is configured, when the stored snapshot was taken, and its series as series() describes them
+    (§5.6)."""
+    snapshot = services.store.external_snapshot()
+    return {"configured": bool(services.config.spylead.url),
+            "snapshot_at": None if snapshot is None else _utc(snapshot.taken_at),
+            "series": series(() if snapshot is None else snapshot.series)}
 
 
 def _market_state(store: Store, market: str) -> dict:
@@ -507,6 +520,29 @@ async def update(request: web.Request) -> web.Response:
     return _json({"lane": job.lane, "kind": job.kind}, 202)
 
 
+async def get_spylead(request: web.Request) -> web.Response:
+    """The stored snapshot (§5.6): when it was taken, and per series its in-sample mark and the first and last day
+    with a value."""
+    return _json(_spylead(_services(request), lambda found: [_external(series) for series in found]))
+
+
+def _external(found: ExternalSeries) -> dict:
+    known = np.flatnonzero(np.isfinite(found.values))
+    first, last = (found.first_day + int(known[0]), found.first_day + int(known[-1])) if len(known) else (None, None)
+    return {"name": found.name, "in_sample": found.in_sample, "first_day": _iso(first), "last_day": _iso(last)}
+
+
+async def snapshot(request: web.Request) -> web.Response:
+    """202 with the job's lane and kind; 409 SPYLEAD_NOT_CONFIGURED without spylead's url, or JOB_RUNNING while the
+    DATA lane is busy."""
+    await read_json(request)
+    services = _services(request)
+    if not services.config.spylead.url:
+        raise ApiError(409, "SPYLEAD_NOT_CONFIGURED", "spylead's url is empty in config.toml")
+    job = services.jobs.snapshot()
+    return _json({"lane": job.lane, "kind": job.kind}, 202)
+
+
 async def cancel(request: web.Request) -> web.Response:
     """204, also when the lane is idle; the LIVE lane's jobs cannot be cancelled (§17.1)."""
     lane = request.match_info["lane"]
@@ -562,16 +598,18 @@ async def reload_strategies(request: web.Request) -> web.Response:
 
 
 async def get_indicators(request: web.Request) -> web.Response:
-    """The registry of §8.6."""
+    """The registry of §8.6, with the stored external series; in_sample marks F and COMPOSITE (§5.6)."""
+    external = stored_series(_services(request).store)
     return _json([
         {"name": o.name, "kind": o.kind, "outputs": list(o.outputs), "source": o.source, "timeframes": list(o.timeframes),
-         "args": {name: {"type": a.type, "default": a.default, "min": a.min, "max": a.max} for name, a in o.args.items()}}
-        for o in operands().values()
+         "args": {name: {"type": a.type, "default": a.default, "min": a.min, "max": a.max} for name, a in o.args.items()},
+         **({"in_sample": external[o.name].in_sample} if o.kind == "series" else {})}
+        for o in operands(external).values()
     ])
 
 
-def _valid_rule(rule: Any) -> dict:
-    issues = validate_rule(rule)
+def _valid_rule(rule: Any, store: Store) -> dict:
+    issues = validate_rule(rule, stored_series(store))
     if issues:
         raise ApiError(400, "RULE_INVALID", f"the rule has {len(issues)} errors", errors=_issues(issues))
     return rule
@@ -589,7 +627,7 @@ async def get_rules(request: web.Request) -> web.Response:
 async def create_rule(request: web.Request) -> web.Response:
     services = _services(request)
     body = _object(await read_json(request), ("name", "rule"))
-    name, rule = _text(body, "name"), _valid_rule(body.get("rule"))
+    name, rule = _text(body, "name"), _valid_rule(body.get("rule"), services.store)
     try:
         rule_id = services.store.create_rule(name, rule, _now(services))
     except StoreError as error:
@@ -600,7 +638,7 @@ async def create_rule(request: web.Request) -> web.Response:
 async def update_rule(request: web.Request) -> web.Response:
     services = _services(request)
     body = _object(await read_json(request), ("name", "rule"))
-    name, rule = _text(body, "name"), _valid_rule(body.get("rule"))
+    name, rule = _text(body, "name"), _valid_rule(body.get("rule"), services.store)
     try:
         found = services.store.update_rule(_id(request), name, rule, _now(services))
     except StoreError as error:
@@ -617,7 +655,8 @@ async def delete_rule(request: web.Request) -> web.Response:
 
 
 async def check_rule(request: web.Request) -> web.Response:
-    issues = validate_rule(_object(await read_json(request), ("rule",)).get("rule"))
+    rule = _object(await read_json(request), ("rule",)).get("rule")
+    issues = validate_rule(rule, stored_series(_services(request).store))
     return _json({"ok": not issues, "errors": _issues(issues)})
 
 

@@ -96,7 +96,7 @@ async def run(config: Config, taxes: TaxTable, stop: asyncio.Event | None = None
         workers = default_workers()
         jobs = Jobs(store, minute_store, Keys(config.tiingo.api_key, config.finmind.token, config.fred.api_key), taxes,
                     lambda: plugins.plugins, pool or process_pool(workers), workers,
-                    notifier=make_notifier(config.email, config.mode))
+                    notifier=make_notifier(config.email, config.mode), spylead=config.spylead)
         app = make_app(Services(config, store, minute_store, jobs, plugins, time.time, notifier=jobs.notifier))
         runner = await (serve or (lambda found: start_site(found, config.web.port)))(app)
         log.info("web server listening on 127.0.0.1")

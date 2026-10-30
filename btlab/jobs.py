@@ -19,8 +19,9 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from btlab import finmind, fred, tiingo
-from btlab.backtest import RunConfig, RunError, load_run, lookahead, run_backtest, save_result, strategy_factory, validate_config
-from btlab.config import ScheduleConfig
+from btlab.backtest import (RunConfig, RunError, load_run, lookahead, run_backtest, save_result, stored_series,
+                            strategy_factory, validate_config)
+from btlab.config import ScheduleConfig, ServiceConfig
 from btlab.finmind import FinMindClient
 from btlab.fred import FredClient
 from btlab.http import RequestBudget, Requester, SourceError, fetch_start, redact
@@ -29,13 +30,14 @@ from btlab.notifier import Notifier, Silent
 from btlab.optimize import NeedsConfirmation, OptimizeError, PoolFactory, Request, optimize, parse_request
 from btlab.plugins import Plugin
 from btlab.prices import ActionIssue, normalize_tw_actions, normalize_us_actions
-from btlab.records import Action, DailyBars, to_date, to_day
+from btlab.records import Action, DailyBars, ExternalSnapshot, to_date, to_day
 from btlab.scheduler import due_updates, exhausted
+from btlab.spylead_client import SOURCE as SPYLEAD, SpyleadClient
 from btlab.store import MinuteStore, Store
 from btlab.taxes import TaxTable
 from btlab.tiingo import TiingoClient
 
-LANES = {"UPDATE_US": "DATA", "UPDATE_TW": "DATA", "BACKTEST": "COMPUTE", "OPTIMIZE": "COMPUTE"}
+LANES = {"UPDATE_US": "DATA", "UPDATE_TW": "DATA", "SPYLEAD_SNAPSHOT": "DATA", "BACKTEST": "COMPUTE", "OPTIMIZE": "COMPUTE"}
 # data_start: 30 years plus one year of indicator warm-up (§4.1).
 DATA_YEARS = 31
 TIINGO_SYMBOL_WARNING = 450
@@ -51,7 +53,7 @@ _END_EVENTS = {
 }
 _SAVED_EVENTS = {"BACKTEST": "BACKTEST_SAVED", "OPTIMIZE": "OPTIMIZATION_SAVED"}
 # What a job's progress and record show; the UI localizes each.
-PHASES = ("CALENDAR", "INFO", "BARS", "ACTIONS", "RATES", "LOAD", "CHECK", "SIMULATE", "SAVE")
+PHASES = ("CALENDAR", "INFO", "BARS", "ACTIONS", "RATES", "SNAPSHOT", "LOAD", "CHECK", "SIMULATE", "SAVE")
 OUTCOMES = (*_END_EVENTS, "DONE")
 
 log = logging.getLogger(__name__)
@@ -162,7 +164,7 @@ class Jobs:
     """The lanes (§17.1): starting, following, stopping and recording jobs. Start them from the event loop.
 
     plugins gives the loaded plugins; pool makes the process pool of §13.7 with workers workers; session makes the
-    aiohttp session of one job (§5.7); clock gives UTC epoch seconds.
+    aiohttp session of one job (§5.7); clock gives UTC epoch seconds. spylead with an empty url is not configured.
     """
 
     def __init__(
@@ -170,10 +172,10 @@ class Jobs:
         plugins: Callable[[], Mapping[str, Plugin]], pool: PoolFactory, workers: int, *,
         notifier: Notifier | None = None, session: Callable[[], Any] = aiohttp.ClientSession,
         clock: Callable[[], float] = time.time, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        keep_awake: KeepAwake | None = None,
+        keep_awake: KeepAwake | None = None, spylead: ServiceConfig = ServiceConfig("", ""),
     ) -> None:
         self.store, self.minute_store, self.keys, self.taxes = store, minute_store, keys, taxes
-        self.plugins, self.pool, self.workers = plugins, pool, workers
+        self.plugins, self.pool, self.workers, self.spylead = plugins, pool, workers, spylead
         self.notifier = notifier or Silent()
         self.session, self.clock, self.sleep = session, clock, sleep
         self.keep_awake = keep_awake or KeepAwake()
@@ -187,15 +189,32 @@ class Jobs:
         """UPDATE_US or UPDATE_TW (§17.2); scheduled_for is the due time a scheduled update answers."""
         return self._start(f"UPDATE_{market}", lambda job: _Update(self, job, market).run(), scheduled_for)
 
+    def snapshot(self) -> Job:
+        """SPYLEAD_SNAPSHOT (§5.6), on the DATA lane."""
+        return self._start("SPYLEAD_SNAPSHOT", self._snapshot)
+
+    async def take_snapshot(self, job: Job, session: Any) -> int:
+        """SNAPSHOT: spylead's series replace the stored set in one transaction, and their count is returned. When
+        spylead fails, the previous snapshot stays, an event SPYLEAD_UNREACHABLE records why, and the error goes on."""
+        job.begin("SNAPSHOT")
+        requester = Requester(SPYLEAD, session, sleep=job.sleep, clock=self.clock)
+        try:
+            series = await SpyleadClient(self.spylead.url, self.spylead.token, requester).snapshot()
+        except SourceError as error:
+            self.event("WARNING", "SPYLEAD_UNREACHABLE", str(error))
+            raise
+        self.store.replace_external_series(ExternalSnapshot(self.now(), series))
+        return len(series)
+
     def backtest(self, raw: Any) -> Job:
         """Validates the configuration first: RunConfigError is the API's 400 INVALID_FIELD."""
         plugins = self.plugins()
-        config = validate_config(raw, plugins)
+        config = validate_config(raw, plugins, stored_series(self.store))
         return self._start("BACKTEST", lambda job: self._backtest(job, config, plugins))
 
     def optimization(self, raw: Any) -> Job:
         """Checks the request first: RunConfigError (INVALID_FIELD) or OptimizeError (TOO_MANY_COMBOS)."""
-        request = parse_request(raw, self.plugins())
+        request = parse_request(raw, self.plugins(), stored_series(self.store))
         return self._start("OPTIMIZE", lambda job: self._optimize(job, request))
 
     def cancel(self, lane: str) -> bool:
@@ -265,6 +284,11 @@ class Jobs:
         if outcome == "FAILED" and job.scheduled_for is not None:
             if exhausted(self.store.latest_job_runs(job.kind, RUNS_SEEN), job.scheduled_for):
                 await self.notifier.send("UPDATE_FAILED", market=market, error=message)
+
+    async def _snapshot(self, job: Job) -> tuple[str, str]:
+        async with self.session() as session:
+            count = await self.take_snapshot(job, session)
+        return "UPDATED", f"series {count}"
 
     async def _backtest(self, job: Job, config: RunConfig, plugins: Mapping[str, Plugin]) -> tuple[str, str]:
         """LOAD, CHECK, SIMULATE (in a pool worker, with the metrics) and SAVE (§17.5)."""
@@ -348,6 +372,8 @@ class _Update:
                     raise
                 return "MAINTENANCE", str(error)
             await self._rates(session, data_start)
+            if self.jobs.spylead.url:
+                await self._snapshot(session)
         return self._outcome(symbols)
 
     def _symbols(self) -> list[str]:
@@ -439,6 +465,13 @@ class _Update:
         except SourceError as error:
             self.failed.append("DTB3")
             self._event("WARNING", "SYMBOL_FAILED", str(error), "DTB3")
+
+    async def _snapshot(self, session: Any) -> None:
+        """SNAPSHOT after the market's data (§17.2): spylead's failure is its event, and the market's data stay good."""
+        try:
+            await self.jobs.take_snapshot(self.job, session)
+        except SourceError:
+            pass
 
     async def _symbol(self, symbol: str, requests: Awaitable[None]) -> None:
         """One symbol's requests; a failure is stored on its row and the update goes on (§17.2)."""

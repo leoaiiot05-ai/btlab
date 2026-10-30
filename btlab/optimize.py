@@ -13,7 +13,7 @@ import multiprocessing
 import os
 import time
 from calendar import monthrange
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Executor, Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import date
@@ -90,15 +90,17 @@ class Request:
     combinations: tuple[Combination, ...]
 
 
-def parse_request(raw: Any, plugins: Mapping[str, Plugin] | None = None) -> Request:
+def parse_request(raw: Any, plugins: Mapping[str, Plugin] | None = None, series: Iterable[str] = ()) -> Request:
     """Checks a request and builds its combinations. Invalid fields raise RunConfigError (INVALID_FIELD) with their
     paths, and more than 2,000 combinations OptimizeError TOO_MANY_COMBOS. A combination that is not a valid run
-    configuration (fast not below slow, say) is kept with its error and never runs."""
+    configuration (fast not below slow, say) is kept with its error and never runs. series names the stored
+    external series a rule may read."""
     if not isinstance(raw, dict):
         raise RunConfigError([("", "the request must be an object")])
     errors = [(key, "is not a known field") for key in raw if key not in _REQUEST_KEYS]
+    series = tuple(series)
     try:
-        config = validate_config(raw.get("config"), plugins)
+        config = validate_config(raw.get("config"), plugins, series)
     except RunConfigError as invalid:
         errors.extend((f"config.{path}" if path else "config", message) for path, message in invalid.errors)
         config = None
@@ -118,7 +120,7 @@ def parse_request(raw: Any, plugins: Mapping[str, Plugin] | None = None) -> Requ
         raise OptimizeError("TOO_MANY_COMBOS", f"{count} combinations; at most {MAX_COMBINATIONS}")
     paths = tuple(ranges)
     combinations = tuple(
-        _combination(config.document, paths, values, plugins) for values in itertools.product(*ranges.values())
+        _combination(config.document, paths, values, plugins, series) for values in itertools.product(*ranges.values())
     )
     if all(combination.config is None for combination in combinations):
         raise RunConfigError([("ranges", f"no combination is a valid configuration: {combinations[0].error}")])
@@ -201,9 +203,10 @@ def _scalar(value: Any) -> bool:
     return value is None or isinstance(value, (bool, str)) or _number(value)
 
 
-def _combination(document: dict, paths: tuple[str, ...], values: tuple, plugins: Mapping[str, Plugin] | None) -> Combination:
+def _combination(document: dict, paths: tuple[str, ...], values: tuple, plugins: Mapping[str, Plugin] | None,
+                 series: tuple[str, ...]) -> Combination:
     try:
-        config = validate_config(combination_config(document, paths, values), plugins)
+        config = validate_config(combination_config(document, paths, values), plugins, series)
     except RunConfigError as invalid:
         return Combination(values, None, None, str(invalid))
     return Combination(values, config, strategy_factory(config, plugins), None)

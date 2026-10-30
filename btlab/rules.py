@@ -268,12 +268,10 @@ class RuleStrategy:
         return Targets("DIRECTION", directions(self.rule, self.params, view))
 
 
-def directions(rule: dict, params: Mapping[str, Any], view: View,
-               series: Mapping[str, np.ndarray] | None = None) -> np.ndarray:
+def directions(rule: dict, params: Mapping[str, Any], view: View) -> np.ndarray:
     """A valid rule's DIRECTION targets, bars × symbols: ±1 in position, by its side, and 0 flat. Per symbol, flat until
-    entry is true, then in position until exit is true (§9.6), from the warm-up's first bar on like the built-ins.
-    series holds the external series it reads, aligned to the bars (§8.5)."""
-    evaluation = _Evaluation(rule["timeframe"], params, view, series or {})
+    entry is true, then in position until exit is true (§9.6), from the warm-up's first bar on like the built-ins."""
+    evaluation = _Evaluation(rule["timeframe"], params, view)
     held = _hold(evaluation.node(rule["entry"]), evaluation.node(rule["exit"]))
     return np.where(held, 1.0 if rule["side"] == "long" else -1.0, 0.0)
 
@@ -291,8 +289,8 @@ def _hold(entry: np.ndarray, exit_: np.ndarray) -> np.ndarray:
 class _Evaluation:
     """A rule's arrays on one view; each distinct operand is computed once."""
 
-    def __init__(self, timeframe: str, params: Mapping[str, Any], view: View, series: Mapping[str, np.ndarray]) -> None:
-        self.timeframe, self.params, self.view, self.series = timeframe, params, view, series
+    def __init__(self, timeframe: str, params: Mapping[str, Any], view: View) -> None:
+        self.timeframe, self.params, self.view = timeframe, params, view
         self.shape = view.bars.close.shape
         self.cache: dict[tuple, np.ndarray] = {}
 
@@ -328,7 +326,7 @@ class _Evaluation:
         if "value" in operand:
             return np.full(self.shape, float(self.value(operand["value"])))
         if "series" in operand:
-            return np.repeat(np.asarray(self.series[operand["series"]], dtype=np.float64)[:, None], self.shape[1], axis=1)
+            return np.repeat(self.view.series(operand["series"])[:, None], self.shape[1], axis=1)
         kind = next(kind for kind in ("ind", "feature", "today") if kind in operand)
         found = REGISTRY[operand[kind]]
         args = default_args(found) | {name: self._arg(found, name, value) for name, value in operand.get("args", {}).items()}

@@ -142,7 +142,8 @@ class Bars:
     bars' times (day numbers or epoch seconds), sessions, tradable flags and the risk-free rate per bar. daily is the
     daily bars on a minute timeline, None on the daily one; ext(name) is an external series, aligned (§8.5)."""
 
-    def __init__(self, view: View, series: Mapping[str, np.ndarray] | None = None) -> None:
+    def __init__(self, view: View) -> None:
+        self._view = view
         self.symbols = view.symbols
         self.times = _readonly(view.days if view.times is None else view.times)
         self.session = _readonly(np.arange(len(view.days)) if view.session is None else view.session)
@@ -155,12 +156,11 @@ class Bars:
             _readonly(previous_session(view.daily.days, getattr(view.daily.bars, name), view.days))
             for name in ("open", "high", "low", "close", "volume")
         ))
-        self._series = dict(series or {})
 
     def ext(self, name: str) -> np.ndarray:
-        if name not in self._series:
+        if name not in self._view.external:
             raise KeyError(f"no external series {name}")
-        return _readonly(self._series[name])
+        return _readonly(self._view.series(name))
 
 
 class Context:

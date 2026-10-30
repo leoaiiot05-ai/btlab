@@ -4,7 +4,7 @@ Each reads the run's adjusted bars (§10.2) and returns DIRECTION or WEIGHTS tar
 strategy that orders through the engine's Book. NaN is no instruction (§9.1).
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -15,6 +15,7 @@ from btlab.engine import Book, OrderStrategy, Targets
 from btlab.features import SessionBars
 from btlab.indicators import Inputs
 from btlab.params import Param
+from btlab.records import ExternalSeries
 
 # DUAL_MOMENTUM compounds the risk-free rate per bar with the daily timeline's bars per year (§8.1).
 BARS_PER_YEAR = 252
@@ -36,7 +37,8 @@ class View:
     """What a strategy reads: the run's adjusted bars from the warm-up on, their tradable flags (§6.5), the DTB3 rate
     in percent per bar, and the first trading bar. days holds each bar's session day. Minute timelines add each bar's
     UTC epoch second (times), its session index and the run's daily bars (§8.4). minute_bars holds each symbol's
-    1-minute bars by day on the daily timeline, adjusted, when the strategy reads features (§8.2)."""
+    1-minute bars by day on the daily timeline, adjusted, when the strategy reads features (§8.2). external holds the
+    stored spylead series by name, which a strategy reads through series(); read names those it read."""
 
     symbols: tuple[str, ...]
     days: np.ndarray
@@ -48,6 +50,19 @@ class View:
     session: np.ndarray | None = None
     daily: Daily | None = None
     minute_bars: tuple[SessionBars, ...] | None = None
+    external: Mapping[str, ExternalSeries] = field(default_factory=dict)
+    read: set[str] = field(default_factory=set)
+
+    def series(self, name: str) -> np.ndarray:
+        """An external series on the bars: a bar on market date d takes calendar day d's value, known on day d (§5.6),
+        and NaN outside the series. Raises KeyError for a series that is not stored."""
+        found = self.external[name]
+        index = self.days - found.first_day
+        inside = (index >= 0) & (index < len(found.values))
+        values = np.full(len(self.days), np.nan)
+        values[inside] = found.values[index[inside]]
+        self.read.add(name)
+        return values
 
 
 Schema = dict[str, Param]

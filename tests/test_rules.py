@@ -15,7 +15,7 @@ from btlab.features import session_bars
 from btlab.indicators import Inputs
 from btlab.intraday import minute_timeline
 from btlab.prices import align
-from btlab.records import DailyBars, MinuteBars, MinuteCoverage, to_date
+from btlab.records import DailyBars, ExternalSeries, MinuteBars, MinuteCoverage, to_date
 from btlab.rules import RuleStrategy, directions, operands_of, validate_rule
 from btlab.store import MinuteStore
 from builders import NOW, TAXES, WEEKDAYS, synthetic_store, walk
@@ -325,9 +325,12 @@ def test_a_rule_like_built_in_a_gives_its_directions():
 
 
 def test_a_series_reads_its_aligned_values_for_every_symbol():
-    view = daily_view(np.ones((4, 2)))
-    found = directions(rule(cond({"series": "SPYL1"}, "gt", value(0))), {}, view, {"SPYL1": np.array([-1.0, 1.0, NAN, 2.0])})
-    assert found.tolist() == [[0, 0], [1, 1], [0, 0], [1, 1]]
+    days = WEEKDAYS[:4]
+    values = np.full(int(days[-1] - days[0]) + 1, 9.0)
+    values[days - days[0]] = [-1.0, 1.0, NAN, 2.0]
+    view = replace(daily_view(np.ones((4, 2))), external={"SPYL1": ExternalSeries("SPYL1", int(days[0]), values, False)})
+    found = directions(rule(cond({"series": "SPYL1"}, "gt", value(0))), {}, view)
+    assert found.tolist() == [[0, 0], [1, 1], [0, 0], [1, 1]] and view.read == {"SPYL1"}
 
 
 def test_features_need_the_views_minute_bars():

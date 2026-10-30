@@ -10,6 +10,7 @@ import math
 import re
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -95,6 +96,14 @@ class RequestBudget:
             self._on_record(self.times)
 
 
+@dataclass(frozen=True)
+class Reply:
+    """A successful answer: its JSON body, None when it has none, and the cookies it set."""
+
+    body: Any
+    cookies: dict[str, str]
+
+
 class Requester:
     """One source during one job: the session passed in, the 30 s timeout, retries, Retry-After and the budget."""
 
@@ -123,24 +132,39 @@ class Requester:
         headers: Mapping[str, str] | None = None,
         error_text: Callable[[Any], str | None] | None = None,
     ) -> Any:
-        """The JSON body of a 200 answer. label describes the request in logs and errors instead of the URL.
+        """The JSON body of a successful answer. label describes the request in logs and errors instead of the URL.
 
-        error_text may take the text of an error from the JSON body of a non-200 answer.
+        error_text may take the text of an error from the JSON body of an unsuccessful answer.
         """
+        return (await self.send("GET", label, url, params=params, headers=headers, error_text=error_text)).body
+
+    async def send(
+        self,
+        method: str,
+        label: str,
+        url: str,
+        *,
+        params: Mapping[str, str] | None = None,
+        body: Any = None,
+        headers: Mapping[str, str] | None = None,
+        error_text: Callable[[Any], str | None] | None = None,
+    ) -> Reply:
+        """One request, body sent as JSON, under the rules of §5.7. Any 2xx answer succeeds."""
         retries = 0
         throttled = False
         while True:
             await self._take_budget()
             log.debug("%s: %s", self.source, label)
             try:
-                status, body, retry_after = await self._attempt(url, params, headers)
+                status, content, retry_after, cookies = await self._attempt(method, url, params, body, headers)
             except TimeoutError:
                 failure = SourceError("TIMEOUT", f"{self.source} did not answer within {TIMEOUT_S:g} s: {label}")
             except aiohttp.ClientError as error:
                 failure = SourceError("UNREACHABLE", f"{self.source} cannot be reached ({type(error).__name__}): {label}")
             else:
-                if status == 200:
-                    return _parse(body, f"{self.source} answered with a body that is not JSON: {label}")
+                if 200 <= status < 300:
+                    text = f"{self.source} answered with a body that is not JSON: {label}"
+                    return Reply(_parse(content, text) if content else None, cookies)
                 if status == 429 and not throttled:
                     throttled = True
                     delay = _retry_after(retry_after)
@@ -149,7 +173,7 @@ class Requester:
                     continue
                 if status == 429:
                     raise SourceError("RATE_LIMITED", f"{self.source} is still rate limiting: {label}")
-                failure = SourceError(f"HTTP_{status}", self._error_text(status, body, label, error_text))
+                failure = SourceError(f"HTTP_{status}", self._error_text(status, content, label, error_text))
                 if status < 500:
                     raise failure
             if retries == len(RETRY_DELAYS_S):
@@ -171,11 +195,13 @@ class Requester:
         self.budget.record(self.clock())
 
     async def _attempt(
-        self, url: str, params: Mapping[str, str], headers: Mapping[str, str] | None
-    ) -> tuple[int, bytes, str | None]:
+        self, method: str, url: str, params: Mapping[str, str] | None, body: Any, headers: Mapping[str, str] | None
+    ) -> tuple[int, bytes, str | None, dict[str, str]]:
         timeout = aiohttp.ClientTimeout(total=TIMEOUT_S)
-        async with self.session.get(url, params=params, headers=headers, timeout=timeout) as response:
-            return response.status, await response.read(), response.headers.get("Retry-After")
+        async with self.session.request(method, url, params=params, json=body, headers=headers, timeout=timeout) as response:
+            # The answer's own cookies: the session's jar refuses those of an IP host such as 127.0.0.1.
+            cookies = {name: morsel.value for name, morsel in response.cookies.items()}
+            return response.status, await response.read(), response.headers.get("Retry-After"), cookies
 
     def _error_text(
         self, status: int, body: bytes, label: str, error_text: Callable[[Any], str | None] | None

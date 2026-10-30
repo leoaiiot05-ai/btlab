@@ -7,8 +7,8 @@ load_run reads the stores; run_backtest is pure given the loaded data, so a pool
 import csv
 import io
 import math
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields, replace
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field, fields, replace
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -45,7 +45,7 @@ from btlab.metrics import (
 from btlab.params import validate_params
 from btlab.plugins import Plugin, PluginStrategy
 from btlab.prices import Aligned, align
-from btlab.records import MinuteBars, ShortSuspension, Trade, to_date, to_day
+from btlab.records import ExternalSeries, MinuteBars, ShortSuspension, Trade, to_date, to_day
 from btlab.rules import RuleStrategy, operands_of, validate_rule
 from btlab.rules import schema as rule_schema
 from btlab.sizing import SIZING_MODES, Sizing
@@ -120,7 +120,7 @@ class RunData:
     """What a run reads, loaded from the stores. aligned holds the run's symbols from the warm-up on, start is the first
     bar of trading, rf the DTB3 rate in force on each day (§12), categories and borrow_fee_pct each symbol's settings
     (§7, None for the run's default). minutes and covered serve minute timelines, the MINUTE intrabar path and
-    features (§8.2)."""
+    features (§8.2). external holds the stored spylead series by name (§5.6)."""
 
     aligned: Aligned
     start: int
@@ -133,6 +133,7 @@ class RunData:
     data_stamp: dict
     minutes: tuple[MinuteBars, ...] | None = None
     covered: tuple[np.ndarray, ...] | None = None
+    external: Mapping[str, ExternalSeries] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, eq=False)
@@ -157,9 +158,9 @@ StrategyFactory = Callable[[View], "Targets | OrderStrategy"]
 # ----- the configuration (§10.1) -----
 
 
-def validate_config(raw: Any, plugins: Mapping[str, Plugin] | None = None) -> RunConfig:
+def validate_config(raw: Any, plugins: Mapping[str, Plugin] | None = None, series: Iterable[str] = ()) -> RunConfig:
     """Checks every field and fills in the market's defaults; raises RunConfigError listing every invalid field.
-    plugins are the loaded plugins a plugin strategy may name."""
+    plugins are the loaded plugins a plugin strategy may name, series the stored external series a rule may read."""
     errors: list[tuple[str, str]] = []
     if not isinstance(raw, dict):
         raise RunConfigError([("", "the configuration must be an object")])
@@ -178,7 +179,7 @@ def validate_config(raw: Any, plugins: Mapping[str, Plugin] | None = None) -> Ru
     timeframe = top.get("timeframe", _choice(*TIMEFRAMES), "1d")
     intraday = _intraday(timeframe, raw.get("intraday"), errors)
     strategy = _strategy(raw.get("strategy"), errors, market, symbols, timeframe, plugins or {},
-                         raw.get("allow_short") is True)
+                         raw.get("allow_short") is True, series)
     sizing = _sizing(raw.get("sizing", {"mode": "FIXED_FRACTION"}), errors)
     exits = _exits(raw.get("exits", {}), errors)
     costs = _costs(market, raw.get("costs", {}), errors)
@@ -352,7 +353,7 @@ def _symbols(market: str, value: Any, errors: list[tuple[str, str]]) -> tuple[st
 
 
 def _strategy(value: Any, errors: list[tuple[str, str]], market: str, symbols: tuple[str, ...], timeframe: str | None,
-              plugins: Mapping[str, Plugin], allow_short: bool) -> dict:
+              plugins: Mapping[str, Plugin], allow_short: bool, series: Iterable[str]) -> dict:
     """The source, its id and its parameters, checked against the strategy's schema (§9.2) and stored complete."""
     if value is None:
         errors.append(("strategy", "is required"))
@@ -361,7 +362,7 @@ def _strategy(value: Any, errors: list[tuple[str, str]], market: str, symbols: t
     fields = _Object(value, "strategy", errors, {"source", "id", "params", *(("rule",) if rule else ())})
     source = fields.get("source", _choice(*STRATEGY_SOURCES))
     if source == "rule":
-        return _rule(fields, errors, timeframe, allow_short)
+        return _rule(fields, errors, timeframe, allow_short, series)
     strategy_id = fields.get("id", _text)
     params = fields.get("params", _object, {})
     if strategy_id is None or params is None:
@@ -385,7 +386,8 @@ def _strategy(value: Any, errors: list[tuple[str, str]], market: str, symbols: t
     return {"source": source, "id": strategy_id, "params": params}
 
 
-def _rule(fields: _Object, errors: list[tuple[str, str]], timeframe: str | None, allow_short: bool) -> dict:
+def _rule(fields: _Object, errors: list[tuple[str, str]], timeframe: str | None, allow_short: bool,
+          series: Iterable[str]) -> dict:
     """A rule run carries the complete rule (§10.1); its own errors keep their codes (§9.6) under strategy.rule. id is
     the stored rule's name, when there is one."""
     rule = fields.get("rule", _object)
@@ -393,7 +395,7 @@ def _rule(fields: _Object, errors: list[tuple[str, str]], timeframe: str | None,
                 "params": fields.get("params", _object, {})}
     if rule is None or document["params"] is None:
         return document
-    issues = validate_rule(rule)
+    issues = validate_rule(rule, series)
     errors.extend((f"strategy.rule.{issue.path}" if issue.path else "strategy.rule", f"{issue.code}: {issue.message}")
                   for issue in issues)
     if issues:
@@ -422,7 +424,7 @@ def view(data: RunData, minute_bars: tuple[SessionBars, ...] | None = None) -> V
     a strategy that reads features (§8.2)."""
     aligned = data.aligned
     return View(aligned.symbols, aligned.days, _adjusted(aligned), aligned.tradable, data.rf, data.start,
-                minute_bars=minute_bars)
+                minute_bars=minute_bars, external=data.external)
 
 
 def _adjusted(aligned: Aligned) -> Inputs:
@@ -580,7 +582,13 @@ def load_run(store: Store, minute_store: MinuteStore | None, config: RunConfig) 
         data["covered"] = covered
     if minute_run:
         _require_minutes(config, data.get("covered"), int(days[-1]))
-    return RunData(**data)
+    return RunData(**data, external=stored_series(store))
+
+
+def stored_series(store: Store) -> dict[str, ExternalSeries]:
+    """The latest spylead snapshot's series by name (§5.6); none before the first snapshot."""
+    snapshot = store.external_snapshot()
+    return {} if snapshot is None else {found.name: found for found in snapshot.series}
 
 
 def _first_minute_day(covered: tuple[np.ndarray, ...], start: int) -> int:
@@ -630,8 +638,11 @@ def run_backtest(config: RunConfig, data: RunData, taxes: TaxTable | None, strat
     benchmark_equity = benchmark.equity_or_nan[benchmark_rows]
     curve = Curve(days, result.equity[rows], rf)
     benchmark_curve = Curve(days, benchmark_equity, rf)
+    # F and COMPOSITE are fitted over their whole history: a strategy that read them is optimistic (§5.6).
+    in_sample = sorted(name for name in strategy_view.read if data.external[name].in_sample)
     flags = {"SURVIVORSHIP": None, **result.flags, **({"BENCHMARK_PARTIAL": None} if partial else {}),
-             **({"LOOKAHEAD_SUSPECT": suspect} if suspect is not None else {})}
+             **({"LOOKAHEAD_SUSPECT": suspect} if suspect is not None else {}),
+             **({"IN_SAMPLE_SERIES": in_sample} if in_sample else {})}
     if minute is not None and config.market == "US":
         windows = pdt_windows(result.trades, timeline.time, timeline.session, minute.session_days, curve.equity,
                               int(timeline.session[timeline.start]))
@@ -719,7 +730,7 @@ def minute_view(minute: MinuteRun, data: RunData) -> View:
                   real=minute.real, minutes=minute.minutes)
     rf = data.rf[np.searchsorted(data.aligned.days, timeline.day)]
     return View(timeline.symbols, timeline.day, bars, timeline.tradable, rf, timeline.start, times=timeline.time,
-                session=timeline.session, daily=Daily(data.aligned.days, _adjusted(data.aligned)))
+                session=timeline.session, daily=Daily(data.aligned.days, _adjusted(data.aligned)), external=data.external)
 
 
 def _cost_model(config: RunConfig, categories: tuple[str, ...], borrow: tuple[float | None, ...], taxes: TaxTable | None) -> CostModel:
