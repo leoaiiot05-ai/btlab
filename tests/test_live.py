@@ -25,7 +25,7 @@ from btlab.store import MinuteStore, Store
 from btlab.web import Services, make_app
 from builders import TAXES, WEEKDAYS, synthetic_store
 from fakes import Answer, FakeSession, InlinePool
-from test_config import VALID, edited, render
+from test_config import VALID, render
 from test_jobs import AAA, KEYS, RATES, SPY, Notes
 
 TOKEN = VALID["web"]["token"]
@@ -223,11 +223,11 @@ def test_confirming_expiry_and_the_lock(market):
     portfolio_id = jobs.create_portfolio(store.backtest(backtest_id), None)
     run(jobs, lambda j: j.generate("US"))
     batch = store.batches(portfolio_id, 1)[0]
-    jobs.confirm(batch, "US", {batch.lines[0].id})
+    jobs.confirm(batch, store.portfolio(portfolio_id), {batch.lines[0].id})
     confirmed = store.batch(batch.id)
     assert (confirmed.status, [x.status for x in confirmed.lines]) == ("CONFIRMED", ["VIRTUAL_PENDING", "SKIPPED_OWNER"])
     with pytest.raises(LiveError) as twice:
-        jobs.confirm(confirmed, "US", set())
+        jobs.confirm(confirmed, store.portfolio(portfolio_id), set())
     assert twice.value.code == "BATCH_EXPIRED"
     with pytest.raises(LiveError) as locked:
         jobs.regenerate(store.portfolio(portfolio_id))
@@ -243,7 +243,7 @@ def test_confirming_expiry_and_the_lock(market):
     jobs.tick(ScheduleConfig(False, (), ()))
     assert store.batch(late.id).status == "EXPIRED" and store.latest_events(1)[0].kind == "BATCH_EXPIRED"
     with pytest.raises(LiveError):
-        jobs.confirm(store.batch(late.id), "US", {late.lines[0].id})
+        jobs.confirm(store.batch(late.id), store.portfolio(portfolio_id), {late.lines[0].id})
 
 
 def test_virtual_fills_the_ledger_and_the_curve(market):
@@ -252,7 +252,7 @@ def test_virtual_fills_the_ledger_and_the_curve(market):
     portfolio_id = jobs.create_portfolio(store.backtest(backtest_id), 100_000.0)
     run(jobs, lambda j: j.generate("US"))
     batch = store.batches(portfolio_id, 1)[0]
-    jobs.confirm(batch, "US", {x.id for x in batch.lines})
+    jobs.confirm(batch, store.portfolio(portfolio_id), {x.id for x in batch.lines})
     prices = {"SPY": (300.0, 302.0, 299.0, 301.0), "AAA": (50.0, 51.0, 49.0, 50.5), "BBB": (20.0, 20.5, 19.5, 20.2)}
     session_bars(store, SESSION, prices)
     run(jobs, lambda j: j.virtual_fill("US"))
@@ -276,7 +276,7 @@ def test_a_session_without_a_bar_expires_its_lines_and_a_split_reaches_the_book(
     portfolio_id = jobs.create_portfolio(store.backtest(backtest_id), 100_000.0)
     run(jobs, lambda j: j.generate("US"))
     batch = store.batches(portfolio_id, 1)[0]
-    jobs.confirm(batch, "US", {x.id for x in batch.lines})
+    jobs.confirm(batch, store.portfolio(portfolio_id), {x.id for x in batch.lines})
     monday = to_day(date(2021, 1, 4))
     session_bars(store, monday, {"SPY": (300.0, 302.0, 299.0, 301.0), "AAA": (50.0, 51.0, 49.0, 50.5),
                                  "BBB": (20.0, 20.5, 19.5, 20.2)})
@@ -319,18 +319,14 @@ def test_an_update_fills_then_generates_and_test_mode_needs_no_order_adapter(mar
 # ----- the routes (§19) -----
 
 
-def serve(tmp_path, store: Store, scenario, mode: str = "test", clock: Clock | None = None):
-    document = edited(None, "mode", mode)
-    if mode == "trade":
-        document["limits"] = {"us_max_orders_per_day": 5, "tw_max_orders_per_day": 5, "max_order_pct_of_equity": 10.0,
-                              "us_max_order_value": 1000.0, "tw_max_order_value": 30000.0}
-    (tmp_path / "config.toml").write_text(render(document), encoding="utf-8")
+def serve(tmp_path, store: Store, scenario, clock: Clock | None = None):
+    (tmp_path / "config.toml").write_text(render(VALID), encoding="utf-8")
     (tmp_path / "strategies").mkdir(exist_ok=True)
     clock = clock or Clock()
     minute = MinuteStore(tmp_path)
 
     async def go():
-        jobs = jobs_of(store, clock, mode=mode)
+        jobs = jobs_of(store, clock)
         services = Services(load_config(tmp_path / "config.toml"), store, minute, jobs, None, clock.clock)
         async with TestClient(TestServer(make_app(services))) as client:
             assert (await client.post("/api/login", json={"token": TOKEN})).status == 204
@@ -390,14 +386,3 @@ def test_the_live_routes_in_test_mode(market, tmp_path):
     assert curve["t"] == [LAST, SESSION] and curve["series"]["PORTFOLIO"] == [None, portfolio["equity"]]
     assert curve["series"]["REPLAY"][0] == curve["series"]["BENCHMARK"][0] == 50_000.0
     assert found["delete"][0] == 204 and found["deleted"][0] == 404
-
-
-def test_trade_mode_cannot_build_or_send_batches_yet(market, tmp_path):
-    store, backtest_id = market
-
-    async def scenario(client, jobs):
-        portfolio_id = (await answer(await client.post("/api/live", json={"backtest_id": backtest_id})))[1]["id"]
-        return [await answer(await client.post(f"/api/live/{portfolio_id}/regenerate", json={}))]
-
-    (refused,) = serve(tmp_path, store, scenario, mode="trade")
-    assert (refused[0], refused[1]["error"]) == (409, "NOT_CONNECTED")

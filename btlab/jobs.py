@@ -39,14 +39,18 @@ from btlab.plugins import Plugin
 from btlab.prices import ActionIssue, normalize_minutes, normalize_tw_actions, normalize_us_actions, share_ratio_after
 from btlab.records import (Action, BacktestRow, Contract, DailyBars, ExternalSnapshot, LedgerRow, Line, LiveBatch, LiveOrder,
                            LivePortfolio, MinuteBars, MinuteCoverage, to_date, to_day)
-from btlab.scheduler import due_updates, exhausted
+from btlab.scheduler import due_sweep, due_updates, exhausted
 from btlab.spylead_client import SOURCE as SPYLEAD, SpyleadClient
 from btlab.store import MinuteStore, Store, StoreError
 from btlab.taxes import TaxTable
 from btlab.tiingo import TiingoClient
+from btlab.trading import TradeError, Trader
 
 LANES = {"UPDATE_US": "DATA", "UPDATE_TW": "DATA", "SPYLEAD_SNAPSHOT": "DATA", "MINUTE_BACKFILL": "MINUTE",
-         "BACKTEST": "COMPUTE", "OPTIMIZE": "COMPUTE", "LIVE_GENERATE": "LIVE", "LIVE_VIRTUAL_FILL": "LIVE"}
+         "BACKTEST": "COMPUTE", "OPTIMIZE": "COMPUTE", "LIVE_GENERATE": "LIVE", "LIVE_VIRTUAL_FILL": "LIVE",
+         "LIVE_SEND": "LIVE", "LIVE_CANCEL": "LIVE", "LIVE_SWEEP": "LIVE"}
+# The last session day swept in trade mode, per market (§15.6).
+SWEEP_KEY = "live_sweep/{market}"
 # The replay's and the benchmark's curves of a live portfolio, from its last batch (§14.6).
 CURVES_KEY = "live_curves/{portfolio}"
 # data_start: 30 years plus one year of indicator warm-up (§4.1).
@@ -62,7 +66,8 @@ _END_EVENTS = {
     # §18 has no kind of its own for an optimization that waits for the owner's confirmation.
     "NEEDS_CONFIRMATION": ("INFO", "JOB_CANCELLED"),
 }
-_SAVED_EVENTS = {"BACKTEST": "BACKTEST_SAVED", "OPTIMIZE": "OPTIMIZATION_SAVED", "LIVE_GENERATE": "BATCH_PROPOSED"}
+_SAVED_EVENTS = {"BACKTEST": "BACKTEST_SAVED", "OPTIMIZE": "OPTIMIZATION_SAVED", "LIVE_GENERATE": "BATCH_PROPOSED",
+                 "LIVE_SEND": "ORDER_SENT", "LIVE_CANCEL": "ORDER_ENDED", "LIVE_SWEEP": "ORDER_ENDED"}
 # What a job's progress and record show; the UI localizes each.
 PHASES = ("CALENDAR", "INFO", "BARS", "ACTIONS", "RATES", "SNAPSHOT", "CONNECT", "MINUTES", "LOAD", "CHECK", "SIMULATE",
           "SAVE")
@@ -197,11 +202,11 @@ class Jobs:
         clock: Callable[[], float] = time.time, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         keep_awake: KeepAwake | None = None, spylead: ServiceConfig = ServiceConfig("", ""),
         ib: IbLink | None = None, backfill_years: int = 3, mode: str = "test",
-        orders: OrdersConfig = OrdersConfig("MOO", 1.0, 3.0),
+        orders: OrdersConfig = OrdersConfig("MOO", 1.0, 3.0), trader: Trader | None = None,
     ) -> None:
         self.store, self.minute_store, self.keys, self.taxes = store, minute_store, keys, taxes
         self.plugins, self.pool, self.workers, self.spylead = plugins, pool, workers, spylead
-        self.ib, self.backfill_years, self.mode, self.orders = ib, backfill_years, mode, orders
+        self.ib, self.backfill_years, self.mode, self.orders, self.trader = ib, backfill_years, mode, orders, trader
         self.notifier = notifier or Silent()
         self.session, self.clock, self.sleep = session, clock, sleep
         self.keep_awake = keep_awake or KeepAwake()
@@ -255,14 +260,37 @@ class Jobs:
             raise LiveError("BATCH_LOCKED", f"batch {latest[0].id} is {latest[0].status} and is never changed")
         return self.generate(portfolio.market)
 
-    def confirm(self, batch: LiveBatch, market: str, lines: Collection[int]) -> None:
-        """The owner's confirmation in test mode (§14.4, §14.5): the chosen lines become VIRTUAL_PENDING and the
-        others SKIPPED_OWNER. LiveError BATCH_EXPIRED unless the batch is PROPOSED and before its cutoff."""
+    def confirm(self, batch: LiveBatch, portfolio: LivePortfolio, lines: Collection[int]) -> Job | None:
+        """The owner's confirmation (§14.4): the chosen lines are confirmed and the others SKIPPED_OWNER. Test mode
+        records them as VIRTUAL_PENDING (§14.5); trade mode checks the batch again and sends it in a LIVE_SEND job
+        (§15.5). LiveError BATCH_EXPIRED unless the batch is PROPOSED and before its cutoff, and in trade mode
+        NOT_CONNECTED or BATCH_STALE."""
+        market = portfolio.market
         if batch.status != "PROPOSED" or self.now() >= cutoff(market, batch.session_day):
             raise LiveError("BATCH_EXPIRED", f"batch {batch.id} can no longer be confirmed")
-        self.store.confirm_batch(batch.id, lines, "VIRTUAL_PENDING", self.now())
+        if self.mode == "trade":
+            try:
+                self.trader.precheck(batch, market)
+            except TradeError as refused:
+                raise LiveError(refused.code, str(refused)) from None
+        self.store.confirm_batch(batch.id, lines, "VIRTUAL_PENDING" if self.mode == "test" else "CONFIRMED", self.now())
         chosen = sum(line.status == "PROPOSED" and line.id in lines for line in batch.lines)
         self.event("INFO", "BATCH_CONFIRMED", f"batch {batch.id} confirmed with {chosen} lines", market)
+        if self.mode != "trade":
+            return None
+        return self._start("LIVE_SEND", lambda job: self.trader.send(self.store.batch(batch.id), portfolio), market=market)
+
+    def cancel_orders(self, batch: LiveBatch, market: str) -> Job:
+        """LIVE_CANCEL: btlab's own working orders of a batch (§15.8)."""
+        return self._start("LIVE_CANCEL", lambda job: self.trader.cancel(batch), market=market)
+
+    def sweep(self, market: str | None = None) -> Job:
+        """LIVE_SWEEP (§15.6, §16.2): after a session, at start, and while a restore fails."""
+        return self._start("LIVE_SWEEP", lambda job: self._sweep(market), market=market)
+
+    async def _sweep(self, market: str | None) -> tuple[str, str]:
+        await self.ib.connect()
+        return await self.trader.sweep(market)
 
     def expire(self) -> None:
         """A PROPOSED batch whose cutoff passed is EXPIRED (§14.4, §17.4)."""
@@ -273,6 +301,16 @@ class Jobs:
                 self.store.set_batch_status(batch.id, "EXPIRED")
                 self.event("INFO", "BATCH_EXPIRED", f"batch {batch.id} for {to_date(batch.session_day)} expired unconfirmed",
                            market)
+
+    def _sweeps(self) -> None:
+        """15 minutes after each session, and every minute while an ended order's protection is not restored."""
+        for market in MARKETS:
+            day = due_sweep(market, self.now(), self.store.setting(SWEEP_KEY.format(market=market)))
+            if day is not None and "LIVE" not in self._jobs:
+                self.store.save_setting(SWEEP_KEY.format(market=market), day)
+                self.sweep(market)
+        if "LIVE" not in self._jobs and self.trader.unresolved():
+            self.sweep()
 
     def next_session(self, market: str) -> int:
         """The session after the latest stored one (§4.3, §14.3)."""
@@ -325,9 +363,11 @@ class Jobs:
         await asyncio.gather(*(job.task for job in jobs))
 
     def tick(self, schedule: ScheduleConfig) -> Job | None:
-        """Expires batches past their cutoff, then starts the first scheduled update that is due (§17.4); a due update
-        waits while the DATA lane is busy."""
+        """Expires batches past their cutoff, starts trade mode's sweeps, then the first scheduled update that is due
+        (§17.4); a due update waits while the DATA lane is busy."""
         self.expire()
+        if self.trader is not None:
+            self._sweeps()
         if not schedule.enabled or "DATA" in self._jobs:
             return None
         runs = {market: self.store.latest_job_runs(f"UPDATE_{market}", RUNS_SEEN) for market in MARKETS}
@@ -366,6 +406,8 @@ class Jobs:
         except RunConfigError as error:
             # A live portfolio's stored configuration no longer validates, say a plugin was removed.
             outcome, message = "FAILED", f"INVALID_FIELD: {error}"
+        except IbError as error:
+            outcome, message = "FAILED", f"IB_{error.kind}: {error}"
         except Exception as error:
             log.exception("%s failed", job.kind)
             outcome, message = "FAILED", redact(f"{type(error).__name__}: {error}")
@@ -391,9 +433,8 @@ class Jobs:
         """After a market's update (§17.2): the virtual fills of the session just stored, then a new batch (test mode);
         and the minute bars: IB may be asked again (§5.4), and a backfill fetches the new sessions, or a running one
         picks them up after its pause."""
-        # Trade mode builds its batches from IB's positions, which come with the order adapter (§14.2, §15).
-        if self.mode == "test" and self.store.active_portfolio(market, self.mode) is not None:
-            self._live(self.virtual_fill, market)
+        if self.store.active_portfolio(market, self.mode) is not None:
+            self._live(self.virtual_fill if self.mode == "test" else self.generate, market)
         if self.ib is None:
             return
         if self.permission(market) == "NO_PERMISSION":
@@ -838,13 +879,19 @@ class _Generate:
         valued = raw if config.price_mode == "REALISTIC" else _last_closes(aligned.symbols, aligned.adj_close)
         targets = replay_targets(replay.holdings, replay.pending)
         weights = target_weights(targets, {s: valued[s] or 0.0 for s in targets}, float(replay.curve.equity[-1]))
-        book = virtual_book(jobs.store, portfolio)
-        lots ={s: live_lot(market, _size_increment(jobs.store.contract(market, s))) for s in config.symbols}
         session_day = jobs.next_session(market)
         offset = jobs.orders.us_limit_offset_pct if market == "US" else jobs.orders.tw_limit_offset_pct
-        equity = book.equity({s: close for s, close in raw.items() if close is not None})
-        lines = batch_lines(market, weights, raw, book.holdings, equity, lots, session_day, jobs.orders.us_order_kind, offset)
-        batch_id = jobs.store.save_batch(portfolio.id, session_day, jobs.now(), book.holdings, lines)
+        if jobs.mode == "trade":
+            # The ledger catches up with the sessions just stored before IB's positions make the batch (§14.6).
+            jobs.trader.catch_up(portfolio, aligned, config.dividend_withholding_pct)
+            lines, current = await jobs.trader.lines(portfolio, weights, raw, session_day, jobs.orders.us_order_kind, offset)
+        else:
+            book = virtual_book(jobs.store, portfolio)
+            lots = {s: live_lot(market, _size_increment(jobs.store.contract(market, s))) for s in config.symbols}
+            equity = book.equity({s: close for s, close in raw.items() if close is not None})
+            current = book.holdings
+            lines = batch_lines(market, weights, raw, current, equity, lots, session_day, jobs.orders.us_order_kind, offset)
+        batch_id = jobs.store.save_batch(portfolio.id, session_day, jobs.now(), current, lines)
         jobs.store.save_setting(CURVES_KEY.format(portfolio=portfolio.id), _curves(replay, portfolio.first_day))
         proposed = sum(line.status == "PROPOSED" for line in lines)
         await jobs.notifier.send("BATCH_READY", market=market, session=to_date(session_day).isoformat(),

@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from btlab.records import JobRun
+from btlab.calendar import session, weekday
+from btlab.markets import MARKETS
+from btlab.records import JobRun, to_day
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 # Python counts Monday as 0. The US update follows each New York session: Tuesday to Saturday in Taipei.
@@ -18,6 +20,7 @@ RETRY_AFTER = timedelta(minutes=30)
 RETRIES = 3
 # FinMind's Sunday maintenance ends at 07:00 Asia/Taipei (§5.2).
 MAINTENANCE_RETRY = time(7, 5)
+SWEEP_DELAY = timedelta(minutes=15)
 
 
 @dataclass(frozen=True)
@@ -75,3 +78,12 @@ def _maintenance_retry(moment: datetime) -> datetime:
     local = moment.astimezone(TAIPEI)
     retry = datetime.combine(local.date(), MAINTENANCE_RETRY, TAIPEI)
     return (retry if retry > local else retry + timedelta(days=1)).astimezone(timezone.utc)
+
+
+def due_sweep(market: str, now: datetime, last_swept: int | None) -> int | None:
+    """The session day whose trade-mode sweep is due, once: 15 minutes after the session's end (§15.6, §17.4). A
+    weekday holiday gets a sweep that finds nothing."""
+    day = to_day(now.astimezone(ZoneInfo(MARKETS[market].time_zone)).date())
+    if weekday(day) >= 5 or (last_swept is not None and last_swept >= day):
+        return None
+    return day if now.timestamp() >= session(market, day)[1] + SWEEP_DELAY.total_seconds() else None

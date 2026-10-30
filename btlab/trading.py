@@ -17,7 +17,7 @@ import numpy as np
 
 from btlab.config import Limits
 from btlab.http import SourceError
-from btlab.ibguard_client import EXITING, IbguardClient
+from btlab.ibguard_client import EXITING, GuardState, IbguardClient
 from btlab.live import ENDED, apply_limits, batch_lines, cutoff, live_lot, rule_price
 from btlab.notifier import Notifier
 from btlab.records import Contract, Exclusion, LedgerRow, Line, LiveBatch, LiveOrder, LivePortfolio, to_date
@@ -28,6 +28,8 @@ READ_ONLY_CODE = 321
 CANCELLED_CODE = 202
 ACK_TIMEOUT_S = 5.0
 WORKING = ("SENT", "WORKING")
+# What btlab last saw of ibguard, for the state document (§19): btlab does not poll ibguard.
+IBGUARD_SEEN = "ibguard_seen"
 
 log = logging.getLogger(__name__)
 
@@ -244,9 +246,12 @@ class Trader:
         if self.ibguard is None:
             return None
         if isinstance(guard, SourceError):
+            remember(self.store, None)
             return "SKIPPED_IBGUARD_UNREACHABLE", str(guard)
         try:
-            position = (await guard.state()).position(line.con_id)
+            state = await guard.state()
+            remember(self.store, state)
+            position = state.position(line.con_id)
             if position is None or position.status == "EXCLUDED":
                 return None
             if position.status in EXITING or position.pending_exit:
@@ -254,6 +259,7 @@ class Trader:
             await guard.exclude(line.con_id, True)
             after = (await guard.state()).position(line.con_id)
         except SourceError as error:
+            remember(self.store, None)
             return "SKIPPED_IBGUARD_UNREACHABLE", str(error)
         if after is None or after.status != "EXCLUDED":
             return "SKIPPED_IBGUARD_EXCLUDE_FAILED", "ibguard did not show the position excluded"
@@ -480,6 +486,13 @@ class Trader:
         positions = self.account.positions()
         return {symbol: positions[contract.con_id] for symbol in portfolio.config["symbols"]
                 if (contract := self.store.contract(portfolio.market, symbol)) and positions.get(contract.con_id)}
+
+
+def remember(store: Store, state: GuardState | None) -> None:
+    """ibguard answered with state, or (None) did not."""
+    seen = {"reachable": False} if state is None else {"reachable": True, "paused": state.paused,
+                                                         "account_kind": state.account_kind}
+    store.save_setting(IBGUARD_SEEN, seen)
 
 
 def _reducing(line: LiveOrder, positions: Mapping[int, float]) -> bool:

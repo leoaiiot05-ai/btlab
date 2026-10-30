@@ -28,6 +28,26 @@ TEXTS = {
                "A {market} batch with {lines} lines waits for your confirmation before {cutoff}."),
         "zh-TW": ("{market} 委託批次待確認（{session}）", "{market} 有一批 {lines} 筆的委託待確認，截止時間 {cutoff}。"),
     },
+    "BATCH_DONE": {
+        "en": ("batch {batch} done ({session})", "Every order of batch {batch} for {session} has ended.\nFills: {fills}"),
+        "zh-TW": ("批次 {batch} 已完成（{session}）", "批次 {batch}（{session}）的委託都已結束。\n成交：{fills}"),
+    },
+    "PROTECTION_RESTORED": {
+        "en": ("ibguard protects {symbol} again",
+               "btlab's order on {symbol} ended with {filled} shares filled and a position left: ibguard protects it again."),
+        "zh-TW": ("ibguard 已恢復保護 {symbol}", "btlab 對 {symbol} 的委託已結束，成交 {filled} 股且仍有部位：ibguard 已恢復保護。"),
+    },
+    "IBGUARD_RESTORE_FAILED": {
+        "en": ("ibguard's protection of {symbol} is still lifted",
+               "btlab could not give {symbol} back to ibguard: {error}\nbtlab retries every minute; check ibguard."),
+        "zh-TW": ("{symbol} 的 ibguard 保護仍未恢復", "btlab 無法讓 ibguard 恢復保護 {symbol}：{error}\nbtlab 每分鐘重試；請檢查 ibguard。"),
+    },
+    "READ_ONLY_API": {
+        "en": ("IB's API is read-only", "IB refused an order of batch {batch} because its API is read-only; the batch stopped.\n"
+               "Uncheck \"Read-Only API\" in IB Gateway's settings, then regenerate before the cutoff."),
+        "zh-TW": ("IB API 為唯讀", "IB 因 API 為唯讀而拒絕批次 {batch} 的委託；批次已停止。\n"
+                  "請在 IB Gateway 設定取消勾選「Read-Only API」，並在截止前重新產生批次。"),
+    },
     "INTERNAL_ERROR": {
         "en": ("internal error",
                "btlab met an unexpected error: {error}\nDetails are in logs/btlab.log. Later errors of this run send no email."),

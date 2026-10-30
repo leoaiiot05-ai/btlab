@@ -11,7 +11,8 @@ import json
 import logging
 import math
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from aiohttp import web
 
 import numpy as np
@@ -27,6 +29,8 @@ from btlab.backtest import TIMEFRAMES, RunConfigError, equity_csv, stored_series
 from btlab.builtins import BUILTINS
 from btlab.calendar import session
 from btlab.config import Config
+from btlab.http import SourceError
+from btlab.ibguard_client import IbguardClient, connected, preview, thresholds_error
 from btlab.intraday import TIMEFRAME_MINUTES, resample
 from btlab.jobs import CURVES_KEY, PERMISSION_KEY, JobRunning, LiveError, virtual_book
 from btlab.live import cutoff
@@ -42,6 +46,7 @@ from btlab.registry import operands
 from btlab.rules import validate_rule
 from btlab.scheduler import next_time
 from btlab.store import MinuteStore, Store, StoreError
+from btlab.trading import IBGUARD_SEEN, remember
 
 HOST = "127.0.0.1"
 STATIC = Path(__file__).resolve().parent / "static"
@@ -100,6 +105,7 @@ class Services:
     clock: Callable[[], float]
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     notifier: Notifier = Silent()
+    session: Callable[[], Any] = aiohttp.ClientSession
 
 
 SERVICES = web.AppKey("services", Services)
@@ -159,6 +165,9 @@ def make_app(services: Services) -> web.Application:
         web.get(r"/api/live/{id:\d+}/batches", get_live_batches),
         web.post(r"/api/live/{id:\d+}/regenerate", regenerate),
         web.post(r"/api/live/batches/{id:\d+}/confirm", confirm_batch),
+        web.post(r"/api/live/batches/{id:\d+}/cancel", cancel_batch),
+        web.get("/api/ibguard/preview", ibguard_preview),
+        web.post("/api/ibguard/thresholds", ibguard_thresholds),
         web.get("/{path:.*}", static),
     ])
     return app
@@ -376,7 +385,7 @@ def _app_state(services: Services, now: datetime) -> dict:
         "server_time": _utc(now),
         "mode": config.mode,
         "keys": {"tiingo": bool(config.tiingo.api_key), "finmind": bool(config.finmind.token), "fred": bool(config.fred.api_key)},
-        "services": {"ib": _ib(services), "spylead": _spylead(services, len)},
+        "services": {"ib": _ib(services), "ibguard": _ibguard_state(services), "spylead": _spylead(services, len)},
         "limits": None if config.mode == "test" or config.limits is None else asdict(config.limits),
         "schedule": {"enabled": schedule.enabled,
                      "next": {m: _utc(next_time(m, at, now)) for m, at in times.items()} if schedule.enabled else None},
@@ -390,6 +399,13 @@ def _ib(services: Services) -> dict:
     return {"configured": bool(services.config.ib.host), "connected": link is not None and link.connected,
             "account_kind": None if link is None else link.account_kind,
             "permissions": {market: services.store.setting(PERMISSION_KEY.format(market=market)) for market in MARKETS}}
+
+
+def _ibguard_state(services: Services) -> dict:
+    """Whether ibguard is configured, and what btlab last saw of it (§16.1); btlab does not poll it."""
+    seen = services.store.setting(IBGUARD_SEEN) or {}
+    return {"configured": bool(services.config.ibguard.url), "reachable": seen.get("reachable"),
+            "paused": seen.get("paused"), "account_kind": seen.get("account_kind")}
 
 
 def _spylead(services: Services, series: Callable[[tuple[ExternalSeries, ...]], Any]) -> dict:
@@ -1189,30 +1205,98 @@ async def regenerate(request: web.Request) -> web.Response:
     """202 with the LIVE_GENERATE job; 409 BATCH_LOCKED once the next session's batch is confirmed, or JOB_RUNNING."""
     await read_json(request)
     services = _services(request)
-    found = _live(services.store, _id(request))
-    _test_mode(services)
-    job = services.jobs.regenerate(found)
+    job = services.jobs.regenerate(_live(services.store, _id(request)))
     return _json({"lane": job.lane, "kind": job.kind}, 202)
 
 
 async def confirm_batch(request: web.Request) -> web.Response:
-    """The owner's confirmation with the lines kept checked (§14.4): 202; 409 BATCH_EXPIRED."""
+    """The owner's confirmation with the lines kept checked (§14.4): 202, and in trade mode the LIVE_SEND job; 409
+    BATCH_EXPIRED, and in trade mode NOT_CONNECTED or BATCH_STALE (§15.5)."""
     services = _services(request)
     lines = _object(await read_json(request), ("lines",)).get("lines")
     if not isinstance(lines, list) or not all(type(line) is int for line in lines):
         raise ApiError(400, "INVALID_FIELD", "must be a list of line ids", "lines")
-    batch = services.store.batch(_id(request))
-    if batch is None:
+    batch = _live_batch(services.store, _id(request))
+    job = services.jobs.confirm(batch, services.store.portfolio(batch.portfolio_id), set(lines))
+    return _json({"batch": batch.id, "status": "CONFIRMED", "job": None if job is None else job.kind}, 202)
+
+
+async def cancel_batch(request: web.Request) -> web.Response:
+    """202 with the LIVE_CANCEL job for btlab's own working orders of the batch (§15.8); 409 NOT_CONNECTED in test
+    mode, which sends no orders."""
+    await read_json(request)
+    services = _services(request)
+    batch = _live_batch(services.store, _id(request))
+    if services.config.mode != "trade":
+        raise ApiError(409, "NOT_CONNECTED", "test mode sends no orders to cancel")
+    job = services.jobs.cancel_orders(batch, services.store.portfolio(batch.portfolio_id).market)
+    return _json({"lane": job.lane, "kind": job.kind}, 202)
+
+
+def _live_batch(store: Store, batch_id: int) -> LiveBatch:
+    found = store.batch(batch_id)
+    if found is None:
         raise ApiError(404, "NOT_FOUND", "no such batch")
-    _test_mode(services)
-    services.jobs.confirm(batch, services.store.portfolio(batch.portfolio_id).market, set(lines))
-    return _json({"batch": batch.id, "status": "CONFIRMED"}, 202)
+    return found
 
 
-def _test_mode(services: Services) -> None:
-    """Trade mode needs IB's positions and orders, which the order adapter brings (§15)."""
-    if services.config.mode != "test":
-        raise ApiError(409, "NOT_CONNECTED", "trade mode cannot build or send batches yet: IB orders are not connected")
+# ----- ibguard thresholds (§16.3) -----
+
+
+async def ibguard_preview(request: web.Request) -> web.Response:
+    """What writing a backtest's ibguard rule as ibguard's STK thresholds would do, with its token; 400
+    NO_IBGUARD_EXIT; 409 IBGUARD_UNREACHABLE."""
+    services = _services(request)
+    backtest_id = _query_integer(request, "backtest_id", None, 1)
+    if backtest_id is None:
+        raise ApiError(400, "INVALID_FIELD", "is required", "backtest_id")
+    tp, sl = _ibguard_exit(_backtest(services.store, backtest_id))
+    async with _ibguard(services) as guard:
+        state = await guard.state()
+    remember(services.store, state)
+    return _json(preview(state, tp, sl))
+
+
+async def ibguard_thresholds(request: web.Request) -> web.Response:
+    """Previews again, and writes the STK thresholds only when the preview still has the owner's token (§16.3): 204;
+    409 PREVIEW_CHANGED or IBGUARD_UNREACHABLE."""
+    services = _services(request)
+    body = _object(await read_json(request), ("backtest_id", "preview_token"))
+    if type(body.get("backtest_id")) is not int:
+        raise ApiError(400, "INVALID_FIELD", "must be a backtest id", "backtest_id")
+    tp, sl = _ibguard_exit(_backtest(services.store, body["backtest_id"]))
+    async with _ibguard(services) as guard:
+        if preview(await guard.state(), tp, sl)["token"] != body.get("preview_token"):
+            raise ApiError(409, "PREVIEW_CHANGED", "ibguard's positions or thresholds changed: preview again")
+        await guard.write_thresholds(tp, sl)
+    services.store.append_event(_now(services), "INFO", "THRESHOLDS_WRITTEN",
+                                f"ibguard's STK thresholds: take-profit {tp:g}%, stop-loss {sl:g}%")
+    return web.Response(status=204)
+
+
+def _ibguard_exit(backtest: BacktestRow) -> tuple[float, float]:
+    """The backtest's ibguard rule, within ibguard's ranges; 400 NO_IBGUARD_EXIT without one."""
+    rule = (backtest.config.get("exits") or {}).get("ibguard")
+    if not rule:
+        raise ApiError(400, "NO_IBGUARD_EXIT", "the backtest's exits have no ibguard rule")
+    tp, sl = float(rule["tp_pct"]), float(rule["sl_pct"])
+    problem = thresholds_error(tp, sl)
+    if problem:
+        raise ApiError(400, "INVALID_FIELD", problem, "exits.ibguard")
+    return tp, sl
+
+
+@asynccontextmanager
+async def _ibguard(services: Services) -> AsyncIterator[IbguardClient]:
+    """A logged-in ibguard client; 409 IBGUARD_UNREACHABLE when ibguard is not configured or does not answer."""
+    if not services.config.ibguard.url:
+        raise ApiError(409, "IBGUARD_UNREACHABLE", "ibguard's url is empty in config.toml")
+    try:
+        async with connected(services.config.ibguard, services.session, services.sleep, services.clock) as guard:
+            yield guard
+    except SourceError as error:
+        remember(services.store, None)
+        raise ApiError(409, "IBGUARD_UNREACHABLE", str(error)) from None
 
 
 # ----- static files (§20) -----

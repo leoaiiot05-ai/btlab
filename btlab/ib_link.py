@@ -54,6 +54,10 @@ class HistoryPort(Protocol):
     async def reqHistoricalDataAsync(self, contract: Any, endDateTime: datetime, durationStr: str, barSizeSetting: str,
                                      whatToShow: str, useRTH: bool, formatDate: int, timeout: float) -> list: ...
 
+    def positions(self, account: str = "") -> list: ...
+
+    async def reqMarketRuleAsync(self, marketRuleId: int) -> list | None: ...
+
 
 def ib_port() -> HistoryPort:
     """ib_async's IB, raising a RequestError for a failed request instead of answering with nothing."""
@@ -75,6 +79,8 @@ class IbLink:
         self.port = port or ib_port()
         self.clock, self.sleep = clock, sleep
         self.account_kind: str | None = None
+        # Trade mode recovers its orders at every connect (§15.7).
+        self.on_connect: Callable[[], Awaitable[None]] | None = None
         self._last_request: float | None = None
 
     @property
@@ -91,9 +97,31 @@ class IbLink:
         except (OSError, TimeoutError) as error:
             raise IbError("UNREACHABLE", f"IB cannot be reached ({type(error).__name__})") from None
         self.account_kind = account_kind(self.config.account, self.port.managedAccounts())
+        if self.on_connect is not None:
+            await self.on_connect()
 
     def close(self) -> None:
         self.port.disconnect()
+
+    def account(self) -> str | None:
+        """The configured account, or the login's only one (§15.5)."""
+        accounts = self.port.managedAccounts()
+        if self.config.account:
+            return self.config.account if self.config.account in accounts else None
+        return accounts[0] if len(accounts) == 1 else None
+
+    def positions(self) -> dict[int, float]:
+        """The account's positions by conId, as IB reports them."""
+        account = self.account()
+        if account is None:
+            return {}
+        return {position.contract.conId: float(position.position) for position in self.port.positions(account)
+                if position.position}
+
+    async def increments(self, rule_id: int) -> list[tuple[float, float]] | None:
+        """A market rule's (low edge, increment) pairs (§15.2), or None when IB gives none."""
+        rules = await self.port.reqMarketRuleAsync(rule_id)
+        return [(float(rule.lowEdge), float(rule.increment)) for rule in rules] if rules else None
 
     async def contract(self, market: str, symbol: str, exchange: str | None) -> Contract:
         """The symbol's IB contract, when IB has exactly one (§5.4): NO_PERMISSION for none, FAILED for several."""
