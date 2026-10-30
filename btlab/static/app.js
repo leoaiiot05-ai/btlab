@@ -71,7 +71,6 @@ function seen(state) {
 function setMode(isOffline) {
   context.offline = isOffline;
   setOffline(isOffline);
-  document.body.classList.toggle("offline", isOffline);
   const banner = document.getElementById("offline");
   if (!banner) return;
   banner.hidden = !isOffline;
@@ -107,7 +106,8 @@ function showShell() {
   root.append(
     h("header", {class: "top"},
       h("span", {class: "brand", text: "btlab"}),
-      h("span", {id: "badge", class: "badge"}),
+      // Offline from the start there is no mode to show.
+      h("span", {id: "badge", class: "badge", hidden: true}),
       h("span", {class: "spacer"}),
       select([["zh-TW", "中文"], ["en", "English"]], current(), switchLanguage),
       button(t("shell.logout"), logout)),
@@ -154,6 +154,7 @@ function showBadge() {
   const app = context.state.app;
   const kind = app.services && app.services.ib ? app.services.ib.account_kind : null;
   const live = app.mode === "trade" && kind === "live";
+  badge.hidden = false;
   badge.className = `badge mode-${app.mode}${live ? " mode-live" : ""}`;
   badge.textContent = app.mode === "trade" ? `${code("mode", "trade")}${kind ? ` · ${code("account", kind)}` : ""}` : code("mode", "test");
   banner.hidden = !live;

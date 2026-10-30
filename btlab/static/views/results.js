@@ -27,7 +27,7 @@ async function list(root, context) {
   const compare = button(t("results.compare"), () => context.go(`compare/${[...chosen].join(",")}`), "primary");
   const body = h("tbody");
   root.append(h("h2", {text: t("view.results")}),
-    h("div", {class: "actions"}, market, name, compare), message,
+    h("div", {class: "actions"}, market, name, context.offline ? null : compare), message,
     h("div", {class: "table-scroll"}, h("table", {class: "table"},
       h("thead", {}, h("tr", {}, ["", t("results.name"), t("results.created"), t("results.market"), t("results.strategy"),
         t("results.period"), ...SHOWN_IN_LIST.map((key) => t(`metric.${key}`)), t("results.flags")].map((label) => h("th", {text: label})))),
@@ -84,6 +84,7 @@ async function page(root, context, id) {
     message.textContent = errorText(error);
     return;
   }
+  // Opening a result refreshes its stored copy, so offline it reads as last seen online.
   context.sync(id);
   const config = detail.config;
   root.append(

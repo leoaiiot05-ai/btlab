@@ -30,7 +30,7 @@ export async function api(method, path, body) {
   try {
     response = await fetch(path, options);
   } catch {
-    // No answer at all, and nothing stored to answer for btlab.
+    // Neither btlab nor the saved results answered.
     throw new ApiError(0, {error: "OFFLINE", message: ""});
   }
   if (response.status === 401 && path !== "/api/login") window.dispatchEvent(new Event(UNAUTHORIZED));
