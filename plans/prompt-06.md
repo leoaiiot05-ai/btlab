@@ -66,3 +66,13 @@ Covers SPEC.md §3, §4.1, §6.5, §9.1, §9.4, §10.1 to §10.7, §10.10, §10.
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-7, AC-8 and AC-9 hold, and so does AC-5's engine part.** `.venv/bin/python -m pytest -q`: 614 passed (also with `-X dev -W error`).
+- Built as planned, with these names and one addition:
+  - `CostModel.commission_rule` holds the markets.py rule, because `commission(quantity, value)` is the method.
+  - **Exit reason CASH_IN_LIEU** (`engine.EXIT_REASONS`): a position that a share event leaves below one share is settled in cash entirely, and its trade ends with this reason. §10.8's list has no reason for it; prompt 17's locale test collects it from the constant.
+  - Borrow fees are charged just before the session's corporate actions rather than after; the amount is the same (the short value at the previous close), and a short closed by cash in lieu still carries its last fee.
+- Timing at bench size (50 symbols × 7,800 bars, MA cross with 4,215 trades, synthetic splits and dividends, no exits): 0.55 s on this VM.
+- **For prompt 7:** `simulate(..., exits=...)` calls `exits.intrabar(simulation, t)` after the open fills and `exits.at_close(simulation, t)` before the strategy; `Simulation.order(j, target, reason)` places an order, `Simulation.fill(t, prices, orders)` fills at a moment, and `open_trades`, `q`, `price`, `instructed` and `executed` are the state an overlay reads.
