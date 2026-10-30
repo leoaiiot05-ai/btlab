@@ -7,7 +7,7 @@ IB or a network client. The web API has no route that writes code (§9.5).
 import importlib.util
 import sys
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Any
@@ -130,17 +130,18 @@ class Bars:
     bars' times (day numbers or epoch seconds), sessions, tradable flags and the risk-free rate per bar. daily is the
     daily bars on a minute timeline, None on the daily one; ext(name) is an external series, aligned (§8.5)."""
 
-    def __init__(self, view: View, times: np.ndarray | None = None, session: np.ndarray | None = None,
-                 daily: Any = None, series: Mapping[str, np.ndarray] | None = None) -> None:
+    def __init__(self, view: View, series: Mapping[str, np.ndarray] | None = None) -> None:
         self.symbols = view.symbols
-        self.times = _readonly(view.days if times is None else times)
-        self.session = _readonly(np.arange(len(view.days)) if session is None else session)
+        self.times = _readonly(view.days if view.times is None else view.times)
+        self.session = _readonly(np.arange(len(view.days)) if view.session is None else view.session)
         self.open, self.high, self.low, self.close, self.volume = (
             _readonly(getattr(view.bars, name)) for name in ("open", "high", "low", "close", "volume")
         )
         self.tradable = _readonly(view.tradable)
         self.rf = _readonly(view.rf)
-        self.daily = daily
+        self.daily = None if view.daily is None else Inputs(
+            *(_readonly(getattr(view.daily, name)) for name in ("open", "high", "low", "close", "volume"))
+        )
         self._series = dict(series or {})
 
     def ext(self, name: str) -> np.ndarray:
@@ -260,8 +261,18 @@ def lookahead_check(signals: Callable, output: str, view: View, params: Mapping[
 
 
 def _cut(view: View, rows: int) -> View:
-    bars = Inputs(*(getattr(view.bars, name)[:rows] for name in ("open", "high", "low", "close", "volume")))
-    return replace(view, days=view.days[:rows], bars=bars, tradable=view.tradable[:rows], rf=view.rf[:rows])
+    """The view's first rows bars."""
+    return replace(view, **{
+        item.name: _head(value, rows) for item in fields(view)
+        if isinstance(value := getattr(view, item.name), (np.ndarray, Inputs))
+    })
+
+
+def _head(value: "np.ndarray | Inputs", rows: int) -> "np.ndarray | Inputs":
+    if isinstance(value, np.ndarray):
+        return value[:rows]
+    return replace(value, **{item.name: getattr(value, item.name)[:rows] for item in fields(value)
+                             if isinstance(getattr(value, item.name), np.ndarray)})
 
 
 def _first_difference(full: Targets, part: Targets, rows: int, symbols: tuple[str, ...]) -> tuple[int, str | None] | None:

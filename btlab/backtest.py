@@ -21,7 +21,15 @@ from btlab.costs import CostModel
 from btlab.engine import EngineResult, OrderStrategy, Settings, Targets, daily_timeline, simulate
 from btlab.exits import DailyMinutePaths, ExitRules, Overlays
 from btlab.features import session_bars
-from btlab.indicators import Inputs
+from btlab.indicators import TRADING_DAYS_PER_YEAR, Inputs
+from btlab.intraday import (
+    TIMEFRAME_MINUTES,
+    WARMUP_SESSIONS,
+    MinuteRun,
+    minute_timeline,
+    pdt_windows,
+    session_end_bars,
+)
 from btlab.markets import MARKETS, PerShareCommission, RateCommission, category_by_rule, normalize_symbol
 from btlab.metrics import (
     Curve,
@@ -44,7 +52,8 @@ from btlab.taxes import TaxTable
 
 # Daily data load from this many bars before the start, for the indicators' warm-up (§10.1).
 WARMUP_BARS = 300
-TIMEFRAMES = ("1d",)
+TIMEFRAMES = ("1d", *TIMEFRAME_MINUTES)
+CLOSE_OUTS = ("NONE", "SESSION_END")
 # Plugins (prompt 10) and rules (prompt 12) add their sources.
 STRATEGY_SOURCES = ("builtin", "plugin")
 PRICE_MODES = ("REALISTIC", "ADJUSTED")
@@ -64,10 +73,11 @@ class RunConfigError(Exception):
 
 
 class RunError(Exception):
-    """A run that cannot proceed, with its code (NO_DATA)."""
+    """A run that cannot proceed, with its code: NO_DATA, or NO_MINUTE_DATA with the symbols that lack minute bars."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, symbols: tuple[str, ...] = ()) -> None:
         self.code = code
+        self.symbols = symbols
         super().__init__(message)
 
 
@@ -98,6 +108,7 @@ class RunConfig:
     dividend_withholding_pct: float
     short_fee_pct: float
     benchmark: str
+    intraday: dict | None = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -159,7 +170,7 @@ def validate_config(raw: Any, plugins: Mapping[str, Plugin] | None = None) -> Ru
     if start is not None and end is not None and end < start:
         errors.append(("end", "must not be before start"))
     timeframe = top.get("timeframe", _choice(*TIMEFRAMES), "1d")
-    top.get("intraday", _null, None)
+    intraday = _intraday(timeframe, raw.get("intraday"), errors)
     strategy = _strategy(raw.get("strategy"), errors, market, symbols, timeframe, plugins or {})
     sizing = _sizing(raw.get("sizing", {"mode": "FIXED_FRACTION"}), errors)
     exits = _exits(raw.get("exits", {}), errors)
@@ -179,14 +190,28 @@ def validate_config(raw: Any, plugins: Mapping[str, Plugin] | None = None) -> Ru
     document = {
         "name": name, "market": market, "symbols": list(symbols), "list_id": list_id, "start": _iso(start),
         "end": _iso(end) if end is not None else None, "timeframe": timeframe, "strategy": strategy,
-        "sizing": sizing[1], "exits": exits[1], **values, "costs": costs[1], "intraday": None,
+        "sizing": sizing[1], "exits": exits[1], **values, "costs": costs[1], "intraday": intraday,
     }
     commission, slippage, borrow, withholding, short_fee = costs[0]
     return RunConfig(
         document=document, name=name, market=market, symbols=symbols, start=start, end=end, timeframe=timeframe,
         strategy=strategy, sizing=sizing[0], exits=exits[0], commission=commission, slippage_bps=slippage,
-        borrow_fee_pct=borrow, dividend_withholding_pct=withholding, short_fee_pct=short_fee, **values,
+        borrow_fee_pct=borrow, dividend_withholding_pct=withholding, short_fee_pct=short_fee, intraday=intraday,
+        **values,
     )
+
+
+def _intraday(timeframe: str | None, value: Any, errors: list[tuple[str, str]]) -> dict | None:
+    """Null on the daily timeline; close-out settings on minute timelines (§11.4)."""
+    if timeframe == "1d" or timeframe is None:
+        if value is not None:
+            errors.append(("intraday", "must be null on the daily timeline"))
+        return None
+    fields = _Object(value or {}, "intraday", errors, {"close_out", "close_out_minutes"})
+    return {
+        "close_out": fields.get("close_out", _choice(*CLOSE_OUTS), "NONE"),
+        "close_out_minutes": fields.get("close_out_minutes", _integer(0, 120), 0),
+    }
 
 
 _TOP_KEYS = {
@@ -238,11 +263,6 @@ def _flag(value: Any) -> bool:
     if not isinstance(value, bool):
         raise _Invalid("must be true or false")
     return value
-
-
-def _null(value: Any) -> None:
-    if value is not None:
-        raise _Invalid("must be null on the daily timeline")
 
 
 def _choice(*options: str) -> Callable[[Any], str]:
@@ -504,15 +524,37 @@ def load_run(store: Store, minute_store: MinuteStore | None, config: RunConfig) 
             for symbol in config.symbols
         },
     }
-    if config.intrabar_path == "MINUTE" and minute_store is not None:
-        first_t, last_t = session(market, int(days[0]))[0], session(market, int(days[-1]))[1]
-        data["minutes"] = tuple(minute_store.minute_bars(market, s, first_t, last_t) for s in config.symbols)
-        data["covered"] = tuple(
+    minute_run = config.timeframe != "1d"
+    if (minute_run or config.intrabar_path == "MINUTE") and minute_store is not None:
+        covered = tuple(
             np.array([c.day for c in minute_store.minute_coverage(market, s, int(days[0]), int(days[-1])) if c.status == "OK"],
                      dtype=np.int64)
             for s in config.symbols
         )
+        first_day = _first_minute_day(covered, config.start) if minute_run else int(days[0])
+        first_t, last_t = session(market, first_day)[0], session(market, int(days[-1]))[1]
+        data["minutes"] = tuple(minute_store.minute_bars(market, s, first_t, last_t) for s in config.symbols)
+        data["covered"] = covered
+    if minute_run:
+        _require_minutes(config, data.get("covered"), int(days[-1]))
     return RunData(**data)
+
+
+def _first_minute_day(covered: tuple[np.ndarray, ...], start: int) -> int:
+    """The first of the 5 covered sessions before the start, for the minute warm-up (§10.1)."""
+    days = np.unique(np.concatenate(covered)) if covered else np.zeros(0, dtype=np.int64)
+    first = max(0, int(np.searchsorted(days, start)) - WARMUP_SESSIONS)
+    return int(days[first]) if len(days) else start
+
+
+def _require_minutes(config: RunConfig, covered: tuple[np.ndarray, ...] | None, end: int) -> None:
+    """A minute run needs every symbol to have coverage OK in its period (§11.2)."""
+    missing = tuple(
+        symbol for j, symbol in enumerate(config.symbols)
+        if covered is None or not ((covered[j] >= config.start) & (covered[j] <= end)).any()
+    )
+    if missing:
+        raise RunError("NO_MINUTE_DATA", f"no minute bars in the period for {', '.join(missing)}", missing)
 
 
 def _category(infos: dict, market: str, symbol: str) -> str:
@@ -523,38 +565,68 @@ def _category(infos: dict, market: str, symbol: str) -> str:
 
 
 def run_backtest(config: RunConfig, data: RunData, taxes: TaxTable | None, strategy: StrategyFactory) -> BacktestResult:
-    """The engine on the run's data, then the benchmark as BUY_HOLD of its symbol at 100% through the same engine
-    (§10.9), the metrics of §12, the flags and the result."""
-    timeline = daily_timeline(data.aligned, data.start)
+    """The engine on the run's timeline, then the benchmark as BUY_HOLD of its symbol at 100% through the same engine
+    (§10.9), the metrics of §12 on the daily bars or the session ends (§11.7), the flags and the result."""
     costs = _cost_model(config, data.categories, data.borrow_fee_pct, taxes)
     settings = _settings(config, costs, data.suspensions)
-    strategy_view = view(data)
+    minute = None
+    if config.timeframe == "1d":
+        timeline, strategy_view, paths = daily_timeline(data.aligned, data.start), view(data), _minute_paths(config, data)
+        points = np.arange(data.start, len(timeline.time))
+    else:
+        intraday = config.intraday
+        minute = minute_timeline(config.market, config.timeframe, data.aligned, data.minutes, data.covered, config.start,
+                                 intraday["close_out"], intraday["close_out_minutes"])
+        timeline, strategy_view = minute.timeline, minute_view(minute, data)
+        paths = minute.paths(adjusted=config.price_mode == "ADJUSTED")
+        points = session_end_bars(timeline.session, timeline.start)
     # A vectorized plugin is checked for look-ahead first; the backtest runs either way (§9.7).
     suspect = strategy.lookahead(strategy_view) if isinstance(strategy, PluginStrategy) else None
-    result = simulate(timeline, strategy(strategy_view), settings, Overlays(config.exits, _minute_paths(config, data)))
+    result = simulate(timeline, strategy(strategy_view), settings, Overlays(config.exits, paths))
+    rows = points - timeline.start
+    days = timeline.day[points]
+    rf = data.rf[np.searchsorted(data.aligned.days, days)]
     benchmark, partial = _benchmark(config, data, taxes)
-    days = timeline.day[data.start:]
-    rf = data.rf[data.start:]
-    curve = Curve(days, result.equity, rf)
-    benchmark_curve = Curve(days, benchmark.equity_or_nan, rf)
+    benchmark_rows = np.searchsorted(data.aligned.days, days) - data.start
+    benchmark_equity = benchmark.equity_or_nan[benchmark_rows]
+    curve = Curve(days, result.equity[rows], rf)
+    benchmark_curve = Curve(days, benchmark_equity, rf)
     flags = {"SURVIVORSHIP": None, **result.flags, **({"BENCHMARK_PARTIAL": None} if partial else {}),
              **({"LOOKAHEAD_SUSPECT": suspect} if suspect is not None else {})}
+    if minute is not None and config.market == "US":
+        windows = pdt_windows(result.trades, timeline.time, timeline.session, minute.session_days, curve.equity,
+                              int(timeline.session[timeline.start]))
+        flags |= {"PDT": windows} if windows else {}
+    known = benchmark_rows[np.isfinite(benchmark_equity)]
     return BacktestResult(
         config=config.document,
-        time_unit="day",
+        time_unit="day" if minute is None else "second",
         series={
-            "TIME": days.astype(np.float64), "EQUITY": result.equity, "BENCHMARK": benchmark.equity_or_nan,
-            "CASH": result.cash, "GROSS": result.gross, "NET": result.net, "POSITIONS": result.positions.astype(np.float64),
+            "TIME": timeline.time[points].astype(np.float64), "EQUITY": curve.equity, "BENCHMARK": benchmark_equity,
+            "CASH": result.cash[rows], "GROSS": result.gross[rows], "NET": result.net[rows],
+            "POSITIONS": result.positions[rows].astype(np.float64),
         },
         trades=result.trades,
         metrics={
-            "strategy": _metrics(curve, result) | relative_metrics(curve, benchmark_curve),
-            "benchmark": _metrics(benchmark_curve.since_first_value(), benchmark.result, benchmark.first),
+            "strategy": _metrics(curve, result, rows) | relative_metrics(curve, benchmark_curve),
+            "benchmark": _metrics(benchmark_curve.since_first_value(), benchmark.result, known),
         },
         tables={"strategy": _tables(curve), "benchmark": _tables(benchmark_curve.since_first_value())},
         flags=flags,
         data_stamp=data.data_stamp,
     )
+
+
+def minute_view(minute: MinuteRun, data: RunData) -> View:
+    """What a strategy reads on a minute timeline: the adjusted bars with their sessions, real-bar marks and minutes
+    since the open (§8.3), VOLATILITY's P of 252 × bars per session (§8.1), and the previous session's daily bars."""
+    timeline = minute.timeline
+    bars = Inputs(timeline.adj_open, timeline.adj_high, timeline.adj_low, timeline.adj_close, minute.volume,
+                  periods_per_year=TRADING_DAYS_PER_YEAR * minute.bars_per_session, session=timeline.session,
+                  real=minute.real, minutes=minute.minutes)
+    rf = data.rf[np.searchsorted(data.aligned.days, timeline.day)]
+    return View(timeline.symbols, timeline.day, bars, timeline.tradable, rf, timeline.start, times=timeline.time,
+                session=timeline.session, daily=minute.daily)
 
 
 def _cost_model(config: RunConfig, categories: tuple[str, ...], borrow: tuple[float | None, ...], taxes: TaxTable | None) -> CostModel:
@@ -597,7 +669,6 @@ def _minute_paths(config: RunConfig, data: RunData) -> DailyMinutePaths | None:
 class _Benchmark:
     result: EngineResult
     equity_or_nan: np.ndarray
-    first: int
 
 
 def _benchmark(config: RunConfig, data: RunData, taxes: TaxTable | None) -> tuple[_Benchmark, bool]:
@@ -614,13 +685,14 @@ def _benchmark(config: RunConfig, data: RunData, taxes: TaxTable | None) -> tupl
     equity = result.equity.copy()
     equity[:first] = np.nan
     partial = not len(known) or first > 0 or known[-1] < len(timeline.day) - data.start - 1
-    return _Benchmark(result, equity, first), partial
+    return _Benchmark(result, equity), partial
 
 
-def _metrics(curve: Curve, result: EngineResult, first: int = 0) -> dict:
+def _metrics(curve: Curve, result: EngineResult, rows: np.ndarray) -> dict:
+    """The curve's metrics, with the engine's exposure and positions at the curve's points (rows of the result)."""
     traded = sum(fill.quantity * fill.price for fill in result.fills)
     return curve_metrics(curve) | trade_metrics(result.trades) | activity_metrics(
-        curve, result.gross[first:], result.positions[first:], traded
+        curve, result.gross[rows], result.positions[rows], traded
     )
 
 

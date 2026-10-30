@@ -21,7 +21,7 @@ WEIGHT_TOLERANCE = 1e-9
 PRICE_MODES = ("REALISTIC", "ADJUSTED")
 FILL_TIMINGS = ("NEXT_OPEN", "SAME_CLOSE")
 # A position that a share event leaves below one share is settled in cash entirely (§10.7).
-EXIT_REASONS = ("SIGNAL", "FORCED_COVER", "CASH_IN_LIEU", "OPEN")
+EXIT_REASONS = ("SIGNAL", "FORCED_COVER", "CASH_IN_LIEU", "CLOSE_OUT", "OPEN")
 _BISECTIONS = 60
 
 
@@ -30,7 +30,8 @@ class Timeline:
     """Bars × symbols of one run (§10.3, §11.2). time holds day numbers on the daily timeline and UTC epoch seconds on
     minute timelines; day is the day of each bar's session; session is a non-decreasing session index. Prices are raw,
     adj_* adjusted (§6.3). cash and ratio are the corporate actions on a session's first bar. Trading and equity start
-    at bar `start` (§10.1)."""
+    at bar `start` (§10.1). closeout, on a minute timeline with close-out, marks each session's close-out bar 1 and
+    the session's later bars 2 (§11.4)."""
 
     symbols: tuple[str, ...]
     time: np.ndarray
@@ -49,6 +50,7 @@ class Timeline:
     cash: np.ndarray
     ratio: np.ndarray
     start: int
+    closeout: np.ndarray | None = None
 
 
 def daily_timeline(aligned: Aligned, start: int) -> Timeline:
@@ -330,16 +332,28 @@ class Simulation:
 
     def _close(self, t: int) -> None:
         """Step 4: value and record equity, the strategy's orders and the due max-hold exits, which replace the
-        strategy's orders for their symbols, then SAME_CLOSE fills."""
+        strategy's orders for their symbols, then close-out or SAME_CLOSE fills."""
         self._value(t)
         self._evaluate(t)
         if self.exits is not None:
             self.exits.at_close(self, t)
-        if self.settings.fill_timing == "SAME_CLOSE" and self.pending:
+        closeout = self.timeline.closeout
+        if closeout is not None and closeout[t]:
+            self._close_out(t)
+        elif self.settings.fill_timing == "SAME_CLOSE" and self.pending:
             self.fill(t, self.close[t], self.pending)
             self._value(t)
         long_value, short_value = self._sides()
         self._records.append((self.timeline.time[t], self.equity, self.cash, long_value, short_value, self.q.copy()))
+
+    def _close_out(self, t: int) -> None:
+        """§11.4: at the close of the close-out bar, and of the session's later bars, every position closes at that
+        close whatever the fill timing, and the pending orders are dropped: no entry fills later in the session, and
+        no order carries into the next one. A close that cannot fill stays pending with its reason."""
+        self.pending = {j: _Order(0.0, "CLOSE_OUT", t) for j in np.flatnonzero(self.q).tolist()}
+        if self.pending:
+            self.fill(t, self.close[t], self.pending)
+            self._value(t)
 
     # ----- corporate actions (§10.7) -----
 

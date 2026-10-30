@@ -24,7 +24,8 @@ DCA_AMOUNT = {"US": 1_000.0, "TW": 30_000.0}
 @dataclass(frozen=True, eq=False)
 class View:
     """What a strategy reads: the run's adjusted bars from the warm-up on, their tradable flags (§6.5), the DTB3 rate
-    in percent per bar, and the first trading bar."""
+    in percent per bar, and the first trading bar. days holds each bar's session day. Minute timelines add each bar's
+    UTC epoch second (times), its session index and the daily bars of the previous session (§8.4)."""
 
     symbols: tuple[str, ...]
     days: np.ndarray
@@ -32,6 +33,9 @@ class View:
     tradable: np.ndarray
     rf: np.ndarray
     start: int
+    times: np.ndarray | None = None
+    session: np.ndarray | None = None
+    daily: Inputs | None = None
 
 
 Schema = dict[str, Param]

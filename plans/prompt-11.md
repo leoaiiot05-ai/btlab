@@ -54,3 +54,11 @@ Covers SPEC.md §8.3, §8.4, §10.8 (minute timelines) and §11. Acceptance: AC-
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-15 holds.** `.venv/bin/python -m pytest -q`: 873 passed (also with `-X dev -W error`). `intraday` joined the pure modules of `tests/test_purity.py`.
+- Built as planned. `minute_timeline` returns a `MinuteRun`; its `paths(adjusted)` gives the overlays each bar's 1-minute bars (`TimelinePaths`).
+- The engine's close-out is `Timeline.closeout` only: at a marked bar's close every position gets a CLOSE_OUT order filled at that close, and the pending orders are replaced, so no entry fills later in the session and nothing carries over.
+- Adjusted minute volume uses the session day's daily ratio of adjusted to raw volume.
+- **For prompts 12–14:** `RunConfig.intraday` holds `close_out` and `close_out_minutes`; `RunError.symbols` lists the symbols of NO_MINUTE_DATA; `minute_view(minute, data)` builds a strategy's `View` on a minute timeline (`times`, `session`, `daily`), and `plugins._cut` truncates every array of a `View`, so the look-ahead check works on both timelines.
