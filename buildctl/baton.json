@@ -1,5 +1,5 @@
 {
-  "by": "build.cmd --release",
-  "holder": "local",
-  "since": "2026-10-30T00:02:45+00:00"
+  "by": "build.cmd --cloud",
+  "holder": "cloud",
+  "since": "2026-10-30T00:03:55+00:00"
 }
