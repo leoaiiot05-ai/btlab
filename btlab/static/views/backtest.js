@@ -62,6 +62,7 @@ function ruleChoice(rule, saved) {
 function build(form, draft, env) {
   // Structural choices (market, strategy, timeframe, sizing mode, exit toggles) rebuild the form from the draft.
   const rebuild = () => build(form, draft, env);
+  env.context.draftConfig = draft;
   clear(form);
   form.onsubmit = (event) => {
     event.preventDefault();

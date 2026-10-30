@@ -33,3 +33,41 @@ Covers SPEC.md §12, §13, §19 and §20 (items 5 and 6 of §20.2, and §20.3). 
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-21 holds.** `.venv/bin/python -m pytest -q`: 1148 passed (also with `-X dev -W error`). The static checks scan the new files and keys; `test_the_chart_colours_make_up_green_and_down_red` checks the constants and the candle colours.
+- Built as planned. ECharts renders under the CSP of §21 unchanged: a headless Chromium smoke run of the results list, a result page, a comparison of 3 runs, the optimizations list and an out-of-sample optimization, at 1280 px light and 375 px dark, logged no page error and no CSP violation, so no `style-src` exception was needed.
+- That run found three things, fixed here: the maximum drawdown read as a green gain (it is stored positive; it now reads as a red loss), an entry marker of a trade held through a split sat at half its candle (a split rescales the trade's average; the candles route now shows the entry as filled), and crowded heatmap labels on phones (compact signed numbers there).
+- The shell now hands views the shared context, so the rule builder's rule really reaches the Backtest view, and the Backtest view's current form reaches Optimize.
+
+### Manual checklist, continued (on the PC and the devices)
+
+Results on each device (Edge on the PC, the iPhone at 375 px, the iPad both ways):
+- [ ] The list filters by market and by name; the flags show in words; a kept-offline result is marked.
+- [ ] A result page shows SURVIVORSHIP as a quiet note and any other flag as a banner with its detail (a run of a peeking plugin shows LOOKAHEAD_SUSPECT with its time and symbol).
+- [ ] Metric cards: the strategy next to its benchmark; gains green with +, losses red with −, the maximum drawdown as a red −.
+
+Charts:
+- [ ] Zoom by pinch on the iPhone and iPad, by dragging on the PC, and with the slider; the range buttons (1M, 6M, 1Y, 5Y, All) set the window.
+- [ ] The log-axis toggle on the equity chart.
+- [ ] Tooltips on tap (phone) and on hover (PC), with values in words and signs.
+- [ ] The monthly heatmap: green months positive, red negative, each with its signed number.
+- [ ] Switch Windows or iOS between light and dark while a result is open: the charts follow.
+
+Candles:
+- [ ] A daily run: candles green when they close up and red when down; ▲ entries and ▼ exits sit on the bars, also for a position held through a split.
+- [ ] A minute run (once IB minute bars exist, prompt 21): candles on the run's timeframe with the markers; "Earlier bars" loads the window before.
+
+Comparison:
+- [ ] Choose 4 results in the list and press Compare: 4 curves starting at 1, and their metrics side by side.
+
+Optimization:
+- [ ] Start from a saved backtest and from the current Backtest form; the ranges come prefilled from the schema; the count updates as ranges change and warns above 2,000.
+- [ ] A long run asks for confirmation with its estimate in minutes; the progress shows while it runs.
+- [ ] A grid: sort the table by each column; the best is starred; the heatmap over two parameters; promote a row and find the new backtest in Results.
+- [ ] An out-of-sample run: in-sample against out-of-sample metrics and the split day.
+- [ ] A walk-forward run over at least 4 years: the windows table, NO_RESULT windows in cash, the chained curve and its metrics.
+
+Exports:
+- [ ] Export trades CSV and equity CSV from a TW result whose symbols have Chinese names, and open them in Excel: the columns of §12, Chinese text intact, times in the market's time zone.

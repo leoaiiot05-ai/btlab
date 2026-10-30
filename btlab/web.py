@@ -769,25 +769,37 @@ async def get_backtest_candles(request: web.Request) -> web.Response:
     symbol = request.match_info["symbol"]
     if symbol not in row.config["symbols"]:
         raise ApiError(404, "NOT_FOUND", "the backtest has no such symbol")
-    found = _candles(services, row.market, symbol, row.timeframe, row.config["price_mode"] == "ADJUSTED",
-                     *_window(request, row.timeframe, services))
+    adjusted_prices = row.config["price_mode"] == "ADJUSTED"
+    found = _candles(services, row.market, symbol, row.timeframe, adjusted_prices, *_window(request, row.timeframe, services))
     trades = [trade for trade in services.store.backtest_trades(row.id) if trade.symbol == symbol]
-    return _json(found | {"markers": _markers(trades, found["t"])})
+    splits = [] if adjusted_prices else [a for a in services.store.actions(row.market, symbol) if a.kind == "SHARE_RATIO"]
+    return _json(found | {"markers": _markers(trades, found["t"], splits, _day_of(row.market, row.timeframe))})
 
 
-def _markers(trades: list[Trade], times: list[int]) -> list[dict]:
-    """Entries, and exits other than OPEN, inside the candles' window."""
+def _markers(trades: list[Trade], times: list[int], splits: list, day_of: Callable[[int], int]) -> list[dict]:
+    """Entries, and exits other than OPEN, inside the candles' window. A share event during a trade rescaled its
+    average entry price and quantity (§10.7); on raw candles the entry shows as it was filled."""
     if not times:
         return []
     found = []
     for trade in trades:
         opening, closing = ("BUY", "SELL") if trade.side == "LONG" else ("SELL", "BUY")
-        moments = [(trade.entry_time, opening, trade.entry_price, "ENTRY")]
+        entered, ended = day_of(trade.entry_time), day_of(trade.exit_time if trade.exit_time is not None else trade.entry_time)
+        factor = math.prod(split.ratio for split in splits if entered < split.day <= ended)
+        moments = [(trade.entry_time, opening, trade.entry_price * factor, trade.quantity / factor, "ENTRY")]
         if trade.exit_reason != "OPEN":
-            moments.append((trade.exit_time, closing, trade.exit_price, trade.exit_reason))
-        found += [{"t": moment, "side": side, "price": _round(price), "quantity": _round(trade.quantity), "reason": reason}
-                  for moment, side, price, reason in moments if times[0] <= moment <= times[-1]]
+            moments.append((trade.exit_time, closing, trade.exit_price, trade.quantity, trade.exit_reason))
+        found += [{"t": moment, "side": side, "price": _round(price), "quantity": _round(quantity), "reason": reason}
+                  for moment, side, price, quantity, reason in moments if times[0] <= moment <= times[-1]]
     return sorted(found, key=lambda marker: marker["t"])
+
+
+def _day_of(market: str, timeframe: str) -> Callable[[int], int]:
+    """A bar time's market day: itself on the daily timeline, the local date of an epoch second on minute ones."""
+    if timeframe == "1d":
+        return int
+    zone = ZoneInfo(MARKETS[market].time_zone)
+    return lambda moment: to_day(datetime.fromtimestamp(int(moment), zone).date())
 
 
 async def export_trades(request: web.Request) -> web.Response:
@@ -841,10 +853,8 @@ async def get_compare(request: web.Request) -> web.Response:
 
 def _curve_by_day(row: BacktestRow, series: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
     equity = series["EQUITY"]
-    times = series["TIME"].astype(np.int64)
-    if row.timeframe != "1d":
-        zone = ZoneInfo(MARKETS[row.market].time_zone)
-        times = np.array([to_day(datetime.fromtimestamp(int(t), zone).date()) for t in times], dtype=np.int64)
+    day_of = _day_of(row.market, row.timeframe)
+    times = np.array([day_of(moment) for moment in series["TIME"].astype(np.int64).tolist()], dtype=np.int64)
     first = equity[np.isfinite(equity)][0]
     return times, equity / first
 
@@ -897,15 +907,15 @@ def _minute_candles(minute_store: MinuteStore, market: str, symbol: str, timefra
                     adjust: bool, first: int, last: int) -> tuple[np.ndarray, list[np.ndarray]]:
     """1-minute bars resampled per session (§11.1); adjusted by their day's scale, as on minute timelines (§11.2)."""
     bars = minute_store.minute_bars(market, symbol, first, last)
-    zone = ZoneInfo(MARKETS[market].time_zone)
-    days = np.array([to_day(datetime.fromtimestamp(int(t), zone).date()) for t in bars.t], dtype=np.int64)
+    day_of = _day_of(market, timeframe)
+    days = np.array([day_of(moment) for moment in bars.t.tolist()], dtype=np.int64)
     opens = {day: session(market, day)[0] for day in np.unique(days).tolist()}
     bars = resample(bars, np.array([opens[day] for day in days.tolist()], dtype=np.int64), TIMEFRAME_MINUTES[timeframe])
     prices = [bars.open, bars.high, bars.low, bars.close]
     if not adjust or not len(bars.t):
         return bars.t, [*prices, bars.volume]
     aligned, _ = align(market, daily.day, {symbol: (daily, actions)})
-    row = np.searchsorted(aligned.days, [to_day(datetime.fromtimestamp(int(t), zone).date()) for t in bars.t])
+    row = np.searchsorted(aligned.days, [day_of(moment) for moment in bars.t.tolist()])
     with np.errstate(divide="ignore", invalid="ignore"):
         volume_scale = aligned.adj_volume[:, 0] / aligned.volume[:, 0]
     volume_scale = np.where(np.isfinite(volume_scale) & (volume_scale > 0), volume_scale, 1.0)

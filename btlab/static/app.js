@@ -4,14 +4,19 @@ import {UNAUTHORIZED, get, post} from "./lib/api.js";
 import {button, clear, h, select} from "./lib/dom.js";
 import {code, current, errorText, load, preferred, t} from "./lib/i18n.js";
 import * as backtest from "./views/backtest.js";
+import * as compare from "./views/compare.js";
 import * as data from "./views/data.js";
 import * as home from "./views/home.js";
 import * as later from "./views/later.js";
+import * as optimize from "./views/optimize.js";
+import * as results from "./views/results.js";
 import * as rules from "./views/rules.js";
 import * as settings from "./views/settings.js";
 
 const TABS = ["home", "data", "backtest", "results", "optimize", "live", "settings"];
-const VIEWS = {home, data, backtest, rules, settings, results: later, optimize: later, live: later};
+const VIEWS = {home, data, backtest, rules, results, compare, optimize, settings, live: later};
+// Views opened from a tab's view keep that tab lit.
+const PARENTS = {rules: "backtest", compare: "results"};
 const FAST_MS = 2000;
 const SLOW_MS = 15000;
 
@@ -19,6 +24,11 @@ const context = {
   state: null,
   // A rule drafted in the rule builder, handed to the Backtest view (§20.2 item 4).
   draftRule: null,
+  // The Backtest view's current form, which the Optimize view can start from (§20.2 item 6).
+  draftConfig: null,
+  // The open view and its argument: #results/12 is the view "results" with "12".
+  name: "home",
+  arg: "",
   refresh: () => poll(),
   go: (view) => {
     location.hash = view;
@@ -82,17 +92,22 @@ function showShell() {
   schedule();
 }
 
+function route() {
+  const [name, ...rest] = location.hash.slice(1).split("/");
+  return [name in VIEWS ? name : "home", rest.join("/")];
+}
+
 function render() {
-  // The open view, from the hash; the rule builder opens from the Backtest view.
-  const name = location.hash.slice(1) || "home";
-  const view = VIEWS[name] || home;
+  // The open view, from the hash. Views share the context, so what one hands over (a rule, a form) reaches another.
+  const [name, arg] = route();
+  Object.assign(context, {name, arg});
   for (const tab of document.querySelectorAll(".tab")) {
-    tab.setAttribute("aria-current", tab.id === `tab-${name === "rules" ? "backtest" : name}` ? "page" : "false");
+    tab.setAttribute("aria-current", tab.id === `tab-${PARENTS[name] || name}` ? "page" : "false");
   }
   const main = document.getElementById("view");
   if (!main) return;
   clear(main);
-  view.render(main, {...context, name});
+  VIEWS[name].render(main, context);
 }
 
 function showBadge() {
@@ -115,11 +130,10 @@ async function poll() {
     context.state = await get("/api/state");
     showBadge();
     const newest = context.state.events.length ? context.state.events[0].id : 0;
-    const name = location.hash.slice(1) || "home";
-    const view = VIEWS[name];
+    const view = VIEWS[route()[0]];
     const main = document.getElementById("view");
-    if (newest > lastEvent && lastEvent && view && view.refreshOn && view.refreshOn(context.state.events, lastEvent)) render();
-    else if (view && view.update && main) view.update(main, {...context, name});
+    if (newest > lastEvent && lastEvent && view.refreshOn && view.refreshOn(context.state.events, lastEvent)) render();
+    else if (view.update && main) view.update(main, context);
     lastEvent = newest;
   } catch (error) {
     if (error.status === 401) return;

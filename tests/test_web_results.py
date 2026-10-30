@@ -315,6 +315,11 @@ def test_backtest_candles_carry_the_trades_as_markers(world):
     entry = found["markers"][0]
     assert (entry["side"], entry["reason"], entry["t"]) == ("BUY", "ENTRY", trades[0].entry_time)
     assert {marker["reason"] for marker in found["markers"]} <= {"ENTRY", "SIGNAL"}
+    # AAA's 2-for-1 split halved the open trade's average entry price; on raw candles the entry shows as filled.
+    split_day = int(WEEKDAYS[400])
+    held = next(trade for trade in trades if trade.entry_time < split_day <= trade.exit_time)
+    marker = next(m for m in found["markers"] if (m["t"], m["reason"]) == (held.entry_time, "ENTRY"))
+    assert (marker["price"], marker["quantity"]) == (float(f"{held.entry_price * 2:.6g}"), float(f"{held.quantity / 2:.6g}"))
 
 
 # ----- compare -----

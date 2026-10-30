@@ -128,6 +128,21 @@ def test_the_page_links_the_manifest_and_the_apple_touch_icon():
     assert png_size(STATIC / icon.lstrip("/")) == (180, 180)
 
 
+def colour(name: str) -> tuple[int, int, int]:
+    (value,) = re.findall(rf'export const {name} = "#([0-9a-f]{{6}})";', (STATIC / "lib" / "colors.js").read_text(encoding="utf-8"))
+    return int(value[:2], 16), int(value[2:4], 16), int(value[4:], 16)
+
+
+def test_the_chart_colours_make_up_green_and_down_red():
+    """§20.3, intentional: green is up and red is down."""
+    red, green, blue = colour("UP")
+    assert green > 1.5 * max(red, blue)
+    red, green, blue = colour("DOWN")
+    assert red > 1.5 * max(green, blue)
+    candles = (STATIC / "views" / "results.js").read_text(encoding="utf-8")
+    assert "itemStyle: {color: UP, color0: DOWN, borderColor: UP, borderColor0: DOWN}" in candles
+
+
 def test_the_vendored_echarts_is_untouched():
     assert hashlib.sha256(ECHARTS.read_bytes()).hexdigest() == ECHARTS_SHA256
     assert {path.name for path in ECHARTS.parent.iterdir()} >= {"echarts.min.js", "LICENSE", "NOTICE"}
