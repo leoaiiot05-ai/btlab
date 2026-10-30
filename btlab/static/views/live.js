@@ -23,12 +23,17 @@ export async function render(root, context) {
     message.textContent = errorText(error);
     return;
   }
+  const services = context.state.app.services;
+  if (context.state.app.mode === "trade" && !services.ibguard.configured) {
+    root.append(h("p", {class: "warning", text: t("live.not_coordinated")}));
+  }
   for (const market of MARKETS) {
     const portfolio = portfolios.find((found) => found.market === market && found.active);
     root.append(h("section", {class: "card live-card"}, h("h3", {text: code("market", market)}),
       portfolio ? portfolioCard(portfolio, context, message)
         : createForm(market, backtests.filter((found) => found.market === market && found.timeframe === "1d"), context, message)));
   }
+  if (services.ibguard.configured) root.append(ibguardPanel(backtests.filter((found) => found.timeframe === "1d")));
   update(root);
 }
 
@@ -82,7 +87,7 @@ function portfolioCard(portfolio, context, message) {
     h("p", {}, `${t("live.cash")} ${number(portfolio.cash, 0)} · ${t("live.equity")} ${number(portfolio.equity, 0)}`),
     holdings(portfolio),
     curve(portfolio),
-    portfolio.batch ? batch(portfolio, portfolio.batch, act) : h("p", {class: "quiet", text: t("live.no_batch")}),
+    portfolio.batch ? batch(portfolio, portfolio.batch, act, context) : h("p", {class: "quiet", text: t("live.no_batch")}),
     h("div", {class: "actions"},
       button(t("live.regenerate"), act(() => post(`/api/live/${portfolio.id}/regenerate`))),
       button(t("live.stop"), () => {
@@ -117,7 +122,7 @@ function curve(portfolio) {
   return container;
 }
 
-function batch(portfolio, current, act) {
+function batch(portfolio, current, act, context) {
   // The current batch: its lines with checkboxes while it can be confirmed, and the countdown to its cutoff (§14.4).
   const open = current.status === "PROPOSED";
   const kept = new Set(current.lines.filter((found) => found.status === "PROPOSED").map((found) => found.id));
@@ -138,15 +143,31 @@ function batch(portfolio, current, act) {
       h("thead", {}, h("tr", {}, ["", "symbol", "action", "quantity", "kind", "limit", "reference", "status", "reason"]
         .map((key) => h("th", {text: key ? t(`live.column_${key}`) : ""})))),
       h("tbody", {}, rows))),
-    open ? h("div", {class: "actions"}, button(t("live.confirm"), () => confirmDialog(portfolio, current, kept, act), "primary")) : null);
+    open ? h("div", {class: "actions"}, button(t("live.confirm"), () => confirmDialog(portfolio, current, kept, act, context), "primary"))
+      : null,
+    current.lines.some((found) => ["SENT", "WORKING"].includes(found.status)) ? h("div", {class: "actions"},
+      button(t("live.cancel_orders"), () => {
+        if (confirm(t("live.confirm_cancel"))) act(() => post(`/api/live/batches/${current.id}/cancel`))();
+      }, "danger")) : null);
 }
 
-function confirmDialog(portfolio, current, kept, act) {
-  // The orders the confirmation makes, and where they go: test mode only records them (§14.5).
+function reducing(found, current) {
+  // A sell of a long or a buy covering a short: ibguard's protection is lifted while its order works (§16.2).
+  const held = current.positions_seen[found.symbol] || 0;
+  return (found.action === "SELL" && held > 0) || (found.action === "BUY" && held < 0);
+}
+
+function confirmDialog(portfolio, current, kept, act, context) {
+  // The orders the confirmation makes, where they go, and the positions whose ibguard protection they lift (§20.2).
   const chosen = current.lines.filter((found) => kept.has(found.id));
+  const kind = context.state.app.services.ib.account_kind;
+  const account = portfolio.mode === "test" ? t("live.virtual") : (kind ? code("account", kind) : "—");
+  const lifted = portfolio.mode === "trade" && context.state.app.services.ibguard.configured
+    ? chosen.filter((found) => reducing(found, current)).map((found) => found.symbol) : [];
   const dialog = h("dialog", {class: "dialog"},
     h("h3", {text: t("live.confirm_title", {session: day(current.session)})}),
-    h("p", {text: t("live.confirm_account", {account: portfolio.mode === "test" ? t("live.virtual") : code("mode", portfolio.mode)})}),
+    h("p", {class: kind === "live" ? "warning" : "", text: t("live.confirm_account", {account})}),
+    lifted.length ? h("p", {class: "detail", text: t("live.exclusions", {symbols: lifted.join(", ")})}) : null,
     chosen.length ? h("ul", {}, chosen.map((found) => h("li", {
       text: `${code("action", found.action)} ${format("count", found.quantity)} ${found.symbol} · ${code("order_kind", found.kind)}${
         found.limit_price === null ? "" : ` ${format("ratio", found.limit_price)}`}`})))
@@ -176,4 +197,52 @@ function history(portfolio) {
     }
   });
   return shown;
+}
+
+function ibguardPanel(backtests) {
+  // ibguard's STK thresholds from a backtest that used the ibguard rule: the preview, then a confirmed write (§16.3).
+  const shown = h("div");
+  const message = h("p", {class: "message", role: "alert"});
+  if (!backtests.length) return h("section", {class: "card"}, h("h3", {text: t("ibguard.title")}), h("p", {class: "quiet", text: t("live.no_daily")}));
+  const chosen = select(backtests.map((found) => [String(found.id), `${found.name} · ${code("market", found.market)}`]), String(backtests[0].id));
+  const show = async () => {
+    clear(shown);
+    message.textContent = "";
+    try {
+      const found = await get(`/api/ibguard/preview?backtest_id=${chosen.value}`);
+      shown.append(preview(found, chosen.value, message));
+    } catch (error) {
+      message.textContent = errorText(error);
+    }
+  };
+  return h("section", {class: "card"}, h("h3", {text: t("ibguard.title")}),
+    field(t("ibguard.backtest"), chosen), h("div", {class: "actions"}, button(t("ibguard.preview"), show)), message, shown);
+}
+
+function preview(found, backtestId, message) {
+  const pair = (pair) => (pair ? t("ibguard.pair", {tp: pair.tp_pct, sl: pair.sl_pct}) : "—");
+  const write = button(t("ibguard.write"), async () => {
+    if (!confirm(t("ibguard.confirm_write", {pair: pair(found.new), count: found.affected.length}))) return;
+    try {
+      await post("/api/ibguard/thresholds", {backtest_id: Number(backtestId), preview_token: found.token});
+      message.textContent = t("ibguard.written");
+    } catch (error) {
+      message.textContent = errorText(error);
+    }
+  }, "primary");
+  return h("div", {},
+    h("p", {class: "detail", text: `${found.account} · ${found.account_kind ? code("account", found.account_kind) : "—"}${
+      found.paused ? ` · ${t("ibguard.paused")}` : ""}`}),
+    h("p", {text: `${t("ibguard.current")} ${pair(found.current)} → ${t("ibguard.new")} ${pair(found.new)}`}),
+    found.affected.length ? h("div", {class: "table-scroll"}, h("table", {class: "table"},
+      h("thead", {}, h("tr", {}, ["symbol", "side", "quantity", "ref", "price", "reason"].map((key) => h("th", {text: t(`ibguard.column_${key}`)})))),
+      h("tbody", {}, found.affected.map((row) => h("tr", {},
+        h("td", {class: "symbol", text: row.symbol}),
+        h("td", {text: code("position_side", row.side)}),
+        h("td", {class: "number", text: format("count", row.quantity)}),
+        h("td", {class: "number", text: row.ref === null ? "—" : format("ratio", row.ref)}),
+        h("td", {class: "number", text: row.price === null ? "—" : format("ratio", row.price)}),
+        h("td", {class: "warning", text: code("guard_exit", row.reason)}))))))
+      : h("p", {class: "quiet", text: t("ibguard.none_exit")}),
+    h("div", {class: "actions"}, write));
 }

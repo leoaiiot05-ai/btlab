@@ -129,7 +129,7 @@ def api_routes(world) -> list[tuple[str, str]]:
 
 def test_every_api_route_but_login_needs_the_session(world):
     routes = api_routes(world)
-    assert len(routes) == 48
+    assert len(routes) == 51
 
     async def scenario(client):
         return [await answer(await client.request(method, path, json={})) for method, path in routes]
@@ -469,6 +469,7 @@ def test_the_state_document(world):
                             "services": {
                                 "ib": {"configured": True, "connected": False, "account_kind": None,
                                        "permissions": {"US": None, "TW": None}},
+                                "ibguard": {"configured": True, "reachable": None, "paused": None, "account_kind": None},
                                 "spylead": {"configured": True, "snapshot_at": None, "series": 0}},
                             "limits": None, "schedule": {"enabled": False, "next": None}}
     assert found["markets"] == {

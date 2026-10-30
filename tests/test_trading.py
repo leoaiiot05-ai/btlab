@@ -474,7 +474,8 @@ def serve(tmp_path, store: Store, scenario, fake: FakeIbguard | None = None):
         trader = trader_of(store, orders, account)
         jobs = Jobs(store, minute, KEYS, TAXES, lambda: {}, InlinePool, 1, clock=lambda: NOW.timestamp(),
                     keep_awake=KeepAwake(lambda flags: None), mode="trade", trader=trader)
-        services = Services(load_config(tmp_path / "config.toml"), store, minute, jobs, None, lambda: NOW.timestamp())
+        services = Services(load_config(tmp_path / "config.toml"), store, minute, jobs, None, lambda: NOW.timestamp(),
+                            _no_sleep)
         try:
             async with TestClient(TestServer(make_app(services))) as client:
                 assert (await client.post("/api/login", json={"token": TOKEN})).status == 204

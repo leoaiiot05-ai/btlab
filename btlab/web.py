@@ -1137,6 +1137,7 @@ def _batch(batch: LiveBatch, market: str) -> dict:
     return {
         "id": batch.id, "session": _iso(batch.session_day), "status": batch.status, "created_at": _utc(batch.created_at),
         "confirmed_at": _utc(batch.confirmed_at), "cutoff": _utc(cutoff(market, batch.session_day)),
+        "positions_seen": batch.positions_seen,
         "lines": [{"id": line.id, "line": line.line, "symbol": line.symbol, "action": line.action, "quantity": line.quantity,
                    "kind": line.kind, "limit_price": line.limit_price, "ref_price": line.ref_price, "status": line.status,
                    "reason": line.reason, "filled_qty": line.filled_qty, "avg_price": line.avg_price,

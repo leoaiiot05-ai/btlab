@@ -5,6 +5,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
@@ -12,11 +13,14 @@ from pathlib import Path
 
 import pytest
 
+import btlab.__main__ as entry
 from btlab.__main__ import LOCKED, main, run, setup_logging, take_lock
 from btlab.config import load_config
+from btlab.ib_link import IbLink
 from btlab.taxes import load_taxes
 from btlab.web import start_site
-from fakes import InlinePool
+from fakes import FakeIB, FakeOrderPort, InlinePool
+from test_config import edited, render
 
 REPO = Path(__file__).resolve().parents[1]
 TOKEN = "Sentinel-Web-Token-0123456789"
@@ -142,6 +146,28 @@ def test_startup_and_shutdown_follow_section_23(tmp_path, caplog):
         "web server stopped", "jobs stopped", "stores closed",
     ]
     assert (root / "data" / "btlab.db").exists() and (root / "data" / "minute.db").exists()
+
+
+@pytest.mark.parametrize("mode", ["test", "trade"])
+def test_only_trade_mode_constructs_the_order_adapter(tmp_path, monkeypatch, mode):
+    """§15.1: test mode never constructs ib_orders' adapter. IB is a fake here, so nothing connects anywhere."""
+    document = edited(None, "mode", mode)
+    if mode == "trade":
+        document["limits"] = {"us_max_orders_per_day": 2, "tw_max_orders_per_day": 2, "max_order_pct_of_equity": 10.0,
+                              "us_max_order_value": 1000.0, "tw_max_order_value": 30000.0}
+    (tmp_path / "config.toml").write_text(render(document), encoding="utf-8")
+    built = []
+    monkeypatch.setattr(entry, "IbOrders", lambda ib: built.append(ib) or FakeOrderPort())
+    monkeypatch.setattr(entry, "IbLink", lambda config, mode: IbLink(config, mode, FakeIB(time.time)))
+    config, taxes = load_config(tmp_path / "config.toml"), load_taxes(REPO / "taxes.toml")
+
+    async def go():
+        stop = asyncio.Event()
+        stop.set()
+        await run(config, taxes, stop, pool=InlinePool, serve=lambda app: start_site(app, 0))
+
+    asyncio.run(go())
+    assert len(built) == (mode == "trade")
 
 
 def test_main_rejects_a_missing_tax_table_before_logging(tmp_path, capsys):
