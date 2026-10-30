@@ -23,12 +23,13 @@ DCA_AMOUNT = {"US": 1_000.0, "TW": 30_000.0}
 
 @dataclass(frozen=True, eq=False)
 class View:
-    """What a built-in reads: the run's adjusted bars from the warm-up on, the DTB3 rate in percent per bar, and the
-    first trading bar."""
+    """What a strategy reads: the run's adjusted bars from the warm-up on, their tradable flags (§6.5), the DTB3 rate
+    in percent per bar, and the first trading bar."""
 
     symbols: tuple[str, ...]
     days: np.ndarray
     bars: Inputs
+    tradable: np.ndarray
     rf: np.ndarray
     start: int
 

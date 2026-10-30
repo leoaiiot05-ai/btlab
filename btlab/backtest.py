@@ -7,7 +7,7 @@ load_run reads the stores; run_backtest is pure given the loaded data, so a pool
 import csv
 import io
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -35,6 +35,7 @@ from btlab.metrics import (
     trade_metrics,
 )
 from btlab.params import validate_params
+from btlab.plugins import Plugin, PluginStrategy
 from btlab.prices import Aligned, align
 from btlab.records import MinuteBars, ShortSuspension, Trade, to_date, to_day
 from btlab.sizing import SIZING_MODES, Sizing
@@ -45,7 +46,7 @@ from btlab.taxes import TaxTable
 WARMUP_BARS = 300
 TIMEFRAMES = ("1d",)
 # Plugins (prompt 10) and rules (prompt 12) add their sources.
-STRATEGY_SOURCES = ("builtin",)
+STRATEGY_SOURCES = ("builtin", "plugin")
 PRICE_MODES = ("REALISTIC", "ADJUSTED")
 FILL_TIMINGS = ("NEXT_OPEN", "SAME_CLOSE")
 INTRABAR_PATHS = ("DAILY", "MINUTE")
@@ -133,14 +134,15 @@ class BacktestResult:
     data_stamp: dict
 
 
-StrategyFactory = Callable[[RunData], "Targets | OrderStrategy"]
+StrategyFactory = Callable[[View], "Targets | OrderStrategy"]
 
 
 # ----- the configuration (§10.1) -----
 
 
-def validate_config(raw: Any) -> RunConfig:
-    """Checks every field and fills in the market's defaults; raises RunConfigError listing every invalid field."""
+def validate_config(raw: Any, plugins: Mapping[str, Plugin] | None = None) -> RunConfig:
+    """Checks every field and fills in the market's defaults; raises RunConfigError listing every invalid field.
+    plugins are the loaded plugins a plugin strategy may name."""
     errors: list[tuple[str, str]] = []
     if not isinstance(raw, dict):
         raise RunConfigError([("", "the configuration must be an object")])
@@ -158,7 +160,7 @@ def validate_config(raw: Any) -> RunConfig:
         errors.append(("end", "must not be before start"))
     timeframe = top.get("timeframe", _choice(*TIMEFRAMES), "1d")
     top.get("intraday", _null, None)
-    strategy = _strategy(raw.get("strategy"), errors, market, symbols)
+    strategy = _strategy(raw.get("strategy"), errors, market, symbols, timeframe, plugins or {})
     sizing = _sizing(raw.get("sizing", {"mode": "FIXED_FRACTION"}), errors)
     exits = _exits(raw.get("exits", {}), errors)
     costs = _costs(market, raw.get("costs", {}), errors)
@@ -322,7 +324,8 @@ def _symbols(market: str, value: Any, errors: list[tuple[str, str]]) -> tuple[st
     return tuple(found)
 
 
-def _strategy(value: Any, errors: list[tuple[str, str]], market: str, symbols: tuple[str, ...]) -> dict:
+def _strategy(value: Any, errors: list[tuple[str, str]], market: str, symbols: tuple[str, ...], timeframe: str | None,
+              plugins: Mapping[str, Plugin]) -> dict:
     """The source, its id and its parameters, checked against the strategy's schema (§9.2) and stored complete."""
     if value is None:
         errors.append(("strategy", "is required"))
@@ -331,26 +334,41 @@ def _strategy(value: Any, errors: list[tuple[str, str]], market: str, symbols: t
     source = fields.get("source", _choice(*STRATEGY_SOURCES))
     strategy_id = fields.get("id", _text)
     params = fields.get("params", _object, {})
-    builtin = BUILTINS.get(strategy_id) if source == "builtin" else None
-    if source == "builtin" and strategy_id is not None and builtin is None:
-        errors.append(("strategy.id", "is not a built-in strategy"))
-    if builtin is not None and params is not None:
+    if strategy_id is None or params is None:
+        return {"source": source, "id": strategy_id, "params": params}
+    if source == "builtin":
+        builtin = BUILTINS.get(strategy_id)
+        if builtin is None:
+            errors.append(("strategy.id", "is not a built-in strategy"))
+            return {"source": source, "id": strategy_id, "params": params}
         params, found = validate_params(builtin.schema(market, symbols), params, "strategy.params")
         errors.extend(found or [(f"strategy.params.{name}", message) for name, message in builtin.check(params)])
+    elif source == "plugin":
+        plugin = plugins.get(strategy_id)
+        if plugin is None:
+            errors.append(("strategy.id", "is not a loaded plugin"))
+            return {"source": source, "id": strategy_id, "params": params}
+        params, found = validate_params(plugin.params, params, "strategy.params")
+        errors.extend(found)
+        if timeframe is not None and plugin.timeframe != timeframe:
+            errors.append(("timeframe", f"must be {plugin.timeframe}, the plugin's timeframe"))
     return {"source": source, "id": strategy_id, "params": params}
 
 
-def strategy_factory(config: RunConfig) -> StrategyFactory:
-    """The factory run_backtest takes, for a validated configuration."""
-    builtin, params = BUILTINS[config.strategy["id"]], config.strategy["params"]
-    return lambda data: builtin.run(view(data), params)
+def strategy_factory(config: RunConfig, plugins: Mapping[str, Plugin] | None = None) -> StrategyFactory:
+    """The strategy run_backtest takes, for a validated configuration."""
+    strategy = config.strategy
+    if strategy["source"] == "plugin":
+        return PluginStrategy(plugins[strategy["id"]], strategy["params"])
+    builtin = BUILTINS[strategy["id"]]
+    return lambda strategy_view: builtin.run(strategy_view, strategy["params"])
 
 
 def view(data: RunData) -> View:
     """What a strategy reads: the adjusted bars from the warm-up on (§10.2)."""
     aligned = data.aligned
     bars = Inputs(aligned.adj_open, aligned.adj_high, aligned.adj_low, aligned.adj_close, aligned.adj_volume)
-    return View(aligned.symbols, aligned.days, bars, data.rf, data.start)
+    return View(aligned.symbols, aligned.days, bars, aligned.tradable, data.rf, data.start)
 
 
 def _object(value: Any) -> dict:
@@ -510,13 +528,17 @@ def run_backtest(config: RunConfig, data: RunData, taxes: TaxTable | None, strat
     timeline = daily_timeline(data.aligned, data.start)
     costs = _cost_model(config, data.categories, data.borrow_fee_pct, taxes)
     settings = _settings(config, costs, data.suspensions)
-    result = simulate(timeline, strategy(data), settings, Overlays(config.exits, _minute_paths(config, data)))
+    strategy_view = view(data)
+    # A vectorized plugin is checked for look-ahead first; the backtest runs either way (§9.7).
+    suspect = strategy.lookahead(strategy_view) if isinstance(strategy, PluginStrategy) else None
+    result = simulate(timeline, strategy(strategy_view), settings, Overlays(config.exits, _minute_paths(config, data)))
     benchmark, partial = _benchmark(config, data, taxes)
     days = timeline.day[data.start:]
     rf = data.rf[data.start:]
     curve = Curve(days, result.equity, rf)
     benchmark_curve = Curve(days, benchmark.equity_or_nan, rf)
-    flags = {"SURVIVORSHIP": None, **result.flags, **({"BENCHMARK_PARTIAL": None} if partial else {})}
+    flags = {"SURVIVORSHIP": None, **result.flags, **({"BENCHMARK_PARTIAL": None} if partial else {}),
+             **({"LOOKAHEAD_SUSPECT": suspect} if suspect is not None else {})}
     return BacktestResult(
         config=config.document,
         time_unit="day",

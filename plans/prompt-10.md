@@ -46,3 +46,11 @@ Covers SPEC.md §9.1, §9.2, §9.5 and §9.7. Acceptance: AC-13.
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-13 holds.** `.venv/bin/python -m pytest -q`: 840 passed (also with `-X dev -W error`).
+- Built as planned. `PluginStrategy` keeps the loaded plugin for runs in this process and pickles as its path and parameters, so a pool worker (prompt 13) loads the file itself.
+- Strategy factories now take the run's `View` (`backtest.view(data)`), and `View` carries the tradable flags that `bars.tradable` exposes.
+- The test builders gained `synthetic_store`, shared by the backtest and plugin tests.
+- **For prompts 11, 13 and 20:** `Bars(view, times, session, daily, series)` takes the minute timeline's times and sessions, the daily bars of §8.4 and the external series; `lookahead_check(signals, output, view, params)` is the optimizer's entry point.

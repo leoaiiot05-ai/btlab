@@ -21,37 +21,13 @@ from btlab.backtest import (
 )
 from btlab.engine import Targets
 from btlab.indicators import sma
-from btlab.records import Action, DailyBars, RiskFreeRates, Trade, to_day
+from btlab.records import Trade, to_day
 from btlab.store import Store
-from builders import TAXES
-
-NOW = datetime(2026, 10, 30, 1, 0, tzinfo=timezone.utc)
-FIRST, LAST = to_day(date(2019, 1, 1)), to_day(date(2020, 12, 31))
-WEEKDAYS = np.array([day for day in range(FIRST, LAST + 1) if (day + 3) % 7 < 5], dtype=np.int64)
-
-
-def walk(seed: int, count: int) -> np.ndarray:
-    return 100 * np.exp(np.cumsum(np.random.default_rng(seed).normal(0.0003, 0.01, count)))
-
-
-def put_bars(store: Store, market: str, symbol: str, days: np.ndarray, close: np.ndarray) -> None:
-    category = "ETF" if symbol in ("SPY", "0050") else "STOCK"
-    store.add_symbol(market, symbol, category, NOW)
-    store.upsert_daily_bars(market, symbol, DailyBars(days, close * 0.999, close * 1.01, close * 0.99, close,
-                                                      np.full(len(days), 1e6), np.zeros(len(days), dtype=bool)))
-
+from builders import NOW, TAXES, WEEKDAYS, put_bars, synthetic_store, walk
 
 @pytest.fixture
 def store(tmp_path):
-    opened = Store(tmp_path)
-    for seed, symbol in enumerate(("SPY", "AAA", "BBB")):
-        put_bars(opened, "US", symbol, WEEKDAYS, walk(seed, len(WEEKDAYS)))
-    opened.replace_actions("US", "AAA", FIRST, LAST, [Action(int(WEEKDAYS[300]), "CASH_DIV", "DIV_RESULT", cash=0.5),
-                                                      Action(int(WEEKDAYS[400]), "SHARE_RATIO", "SPLIT", ratio=2.0)])
-    opened.upsert_rf_rates(RiskFreeRates(WEEKDAYS[::5], np.full(len(WEEKDAYS[::5]), 2.0)))
-    opened.replace_trading_days("TW", WEEKDAYS)
-    for seed, symbol in enumerate(("0050", "2330"), 10):
-        put_bars(opened, "TW", symbol, WEEKDAYS, walk(seed, len(WEEKDAYS)))
+    opened = synthetic_store(tmp_path)
     yield opened
     opened.close()
 
@@ -61,8 +37,8 @@ def config(**changes) -> dict:
             "strategy": {"source": "builtin", "id": "MA_CROSS"}, **changes}
 
 
-def ma_cross(data):
-    close = data.aligned.adj_close
+def ma_cross(strategy_view):
+    close = strategy_view.bars.close
     return Targets("DIRECTION", np.where(sma(close, 10) > sma(close, 30), 1.0, 0.0))
 
 

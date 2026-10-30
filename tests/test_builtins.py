@@ -25,7 +25,7 @@ def view(closes, highs=None, lows=None, *, days=None, rf=None, start=0, symbols=
     low = close if lows is None else np.array(lows, dtype=np.float64).reshape(close.shape)
     days = np.arange(DAY0, DAY0 + len(close)) if days is None else np.array(days)
     return View(symbols or tuple("ABCDEFG"[: close.shape[1]]), days, Inputs(close, high, low, close, np.full(close.shape, 1e3)),
-                np.zeros(len(close)) if rf is None else np.array(rf, dtype=np.float64), start)
+                np.isfinite(close), np.zeros(len(close)) if rf is None else np.array(rf, dtype=np.float64), start)
 
 
 def run(builtin_id: str, data: View, **params):
@@ -207,7 +207,7 @@ def random_view(rows: int, seed: int) -> View:
 
 def cut(data: View, rows: int) -> View:
     bars_ = Inputs(*(getattr(data.bars, name)[:rows] for name in ("open", "high", "low", "close", "volume")))
-    return dataclasses.replace(data, days=data.days[:rows], bars=bars_, rf=data.rf[:rows])
+    return dataclasses.replace(data, days=data.days[:rows], bars=bars_, tradable=data.tradable[:rows], rf=data.rf[:rows])
 
 
 def altered(data: View, rows: int) -> View:
