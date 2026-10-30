@@ -1,6 +1,9 @@
-"""Fakes shared by the tests (SPEC.md §24.1): an HTTP session and an injected clock with its sleep."""
+"""Fakes shared by the tests (SPEC.md §24.1): an HTTP session, an injected clock with its sleep, and a synchronous
+stand-in for the process pool."""
 
 import json
+from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -78,3 +81,40 @@ class FakeTime:
     async def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
         self.now += seconds
+
+
+class _LaterFuture(Future):
+    """A task that runs in this process when its result is first asked for, so a cancel leaves later tasks unrun."""
+
+    def __init__(self, function: Callable, args: tuple) -> None:
+        super().__init__()
+        self._call = (function, args)
+
+    def result(self, timeout: float | None = None) -> Any:
+        if not self.done():
+            function, args = self._call
+            self.set_result(function(*args))
+        return super().result(timeout)
+
+
+class InlinePool:
+    """The pool's in-process stand-in (§13.7): the initializer runs here once, then every task when its result is
+    asked for. It counts the tasks it ran."""
+
+    def __init__(self, initializer: Callable[..., None] | None = None, initargs: tuple = ()) -> None:
+        if initializer is not None:
+            initializer(*initargs)
+        self.ran = 0
+
+    def submit(self, function: Callable, *args: Any) -> Future:
+        def counted(*call_args: Any) -> Any:
+            self.ran += 1
+            return function(*call_args)
+
+        return _LaterFuture(counted, args)
+
+    def __enter__(self) -> "InlinePool":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        return None

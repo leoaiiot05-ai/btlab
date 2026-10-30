@@ -32,6 +32,7 @@ from btlab.records import (
     JobRun,
     MinuteBars,
     MinuteCoverage,
+    OptimizationRow,
     RiskFreeRates,
     RuleRow,
     ShortSuspension,
@@ -747,6 +748,38 @@ class Store(_Database):
         )
         return [Trade(*row) for row in rows]
 
+    # ----- optimizations (§13.7) -----
+
+    def save_optimization(
+        self, created_at: datetime, name: str, market: str, mode: str, status: str, config: dict, results: dict,
+        best: dict | None, flags: dict,
+    ) -> int:
+        with self._write() as db:
+            cursor = db.execute(
+                "INSERT INTO optimizations (created_at, name, market, mode, status, config, results, best, flags)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (_iso(created_at), name, market, mode, status, _json(config), _json(results),
+                 None if best is None else _json(best), _json(flags)),
+            )
+        return cursor.lastrowid
+
+    def optimization(self, optimization_id: int) -> OptimizationRow | None:
+        rows = self._read(f"SELECT {_OPTIMIZATION_COLUMNS}, results FROM optimizations WHERE id = ?", (optimization_id,))
+        return _optimization(*rows[0]) if rows else None
+
+    def optimizations(self, market: str | None = None) -> list[OptimizationRow]:
+        """Newest first, without their results."""
+        rows = self._read(
+            f"SELECT {_OPTIMIZATION_COLUMNS}, NULL FROM optimizations WHERE ?1 IS NULL OR market = ?1 ORDER BY id DESC",
+            (market,),
+        )
+        return [_optimization(*row) for row in rows]
+
+    def delete_optimization(self, optimization_id: int) -> bool:
+        with self._write() as db:
+            cursor = db.execute("DELETE FROM optimizations WHERE id = ?", (optimization_id,))
+        return cursor.rowcount == 1
+
     # ----- events and job runs (§17.1, §18) -----
 
     def append_event(
@@ -948,3 +981,13 @@ def _array(blob: bytes) -> np.ndarray:
 def _json(value: Any) -> str:
     """Settings values; NaN and infinities are refused, because JSON has no such numbers."""
     return json.dumps(value, allow_nan=False)
+
+
+_OPTIMIZATION_COLUMNS = "id, created_at, name, market, mode, status, config, best, flags"
+
+
+def _optimization(id_: int, created_at: str, name: str, market: str, mode: str, status: str, config: str,
+                  best: str | None, flags: str, results: str | None) -> OptimizationRow:
+    return OptimizationRow(id_, _moment(created_at), name, market, mode, status, json.loads(config),
+                           None if best is None else json.loads(best), json.loads(flags),
+                           None if results is None else json.loads(results))

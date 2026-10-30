@@ -8,17 +8,17 @@ import csv
 import io
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from btlab.builtins import BUILTINS, Daily, View
+from btlab.builtins import BUILTINS, BuiltinStrategy, Daily, View
 from btlab.calendar import session
 from btlab.costs import CostModel
-from btlab.engine import EngineResult, OrderStrategy, Settings, Targets, daily_timeline, simulate
+from btlab.engine import EngineResult, OrderStrategy, Settings, Targets, Timeline, daily_timeline, simulate
 from btlab.exits import DailyMinutePaths, ExitRules, Overlays
 from btlab.features import SessionBars, session_bars
 from btlab.indicators import TRADING_DAYS_PER_YEAR, Inputs
@@ -135,7 +135,7 @@ class RunData:
 @dataclass(frozen=True, eq=False)
 class BacktestResult:
     """A run's result (§10.11): the series of §18, the trades, metrics and tables of the strategy and its benchmark,
-    the flags with their details, and the data stamp."""
+    the flags with their details, the data stamp, and the strategy's curve with each point's day and DTB3 rate."""
 
     config: dict
     time_unit: str
@@ -145,6 +145,7 @@ class BacktestResult:
     tables: dict
     flags: dict
     data_stamp: dict
+    curve: Curve
 
 
 StrategyFactory = Callable[[View], "Targets | OrderStrategy"]
@@ -410,8 +411,7 @@ def strategy_factory(config: RunConfig, plugins: Mapping[str, Plugin] | None = N
         return PluginStrategy(plugins[strategy["id"]], strategy["params"])
     if strategy["source"] == "rule":
         return RuleStrategy(strategy["rule"], strategy["params"])
-    builtin = BUILTINS[strategy["id"]]
-    return lambda strategy_view: builtin.run(strategy_view, strategy["params"])
+    return BuiltinStrategy(strategy["id"], strategy["params"])
 
 
 def view(data: RunData, minute_bars: tuple[SessionBars, ...] | None = None) -> View:
@@ -604,26 +604,20 @@ def _category(infos: dict, market: str, symbol: str) -> str:
 # ----- running (pure) -----
 
 
-def run_backtest(config: RunConfig, data: RunData, taxes: TaxTable | None, strategy: StrategyFactory) -> BacktestResult:
+def run_backtest(config: RunConfig, data: RunData, taxes: TaxTable | None, strategy: StrategyFactory,
+                 check_lookahead: bool = True, flatten: bool = False) -> BacktestResult:
     """The engine on the run's timeline, then the benchmark as BUY_HOLD of its symbol at 100% through the same engine
-    (§10.9), the metrics of §12 on the daily bars or the session ends (§11.7), the flags and the result."""
+    (§10.9), the metrics of §12 on the daily bars or the session ends (§11.7), the flags and the result. An
+    optimization's grid skips the look-ahead check (§9.7); flatten closes every position at the last bar's close,
+    with costs, as a walk-forward test window does (§13.5)."""
     costs = _cost_model(config, data.categories, data.borrow_fee_pct, taxes)
     settings = _settings(config, costs, data.suspensions)
-    minute = None
-    if config.timeframe == "1d":
-        minute_bars = tuple(_session_bars(config, data, adjusted=True)) if _reads_features(config) else None
-        timeline, strategy_view = daily_timeline(data.aligned, data.start), view(data, minute_bars)
-        paths = _minute_paths(config, data)
-        points = np.arange(data.start, len(timeline.time))
-    else:
-        intraday = config.intraday
-        minute = minute_timeline(config.market, config.timeframe, data.aligned, data.minutes, data.covered, config.start,
-                                 intraday["close_out"], intraday["close_out_minutes"])
-        timeline, strategy_view = minute.timeline, minute_view(minute, data)
-        paths = minute.paths(adjusted=config.price_mode == "ADJUSTED")
-        points = session_end_bars(timeline.session, timeline.start)
+    timeline, strategy_view, minute, points = _prepare(config, data)
+    paths = _minute_paths(config, data) if minute is None else minute.paths(adjusted=config.price_mode == "ADJUSTED")
     # A vectorized plugin is checked for look-ahead first; the backtest runs either way (§9.7).
-    suspect = strategy.lookahead(strategy_view) if isinstance(strategy, PluginStrategy) else None
+    suspect = _lookahead(strategy, strategy_view) if check_lookahead else None
+    if flatten:
+        timeline = _flattened(timeline)
     result = simulate(timeline, strategy(strategy_view), settings, Overlays(config.exits, paths))
     rows = points - timeline.start
     days = timeline.day[points]
@@ -656,7 +650,61 @@ def run_backtest(config: RunConfig, data: RunData, taxes: TaxTable | None, strat
         tables={"strategy": _tables(curve), "benchmark": _tables(benchmark_curve.since_first_value())},
         flags=flags,
         data_stamp=data.data_stamp,
+        curve=curve,
     )
+
+
+def _prepare(config: RunConfig, data: RunData) -> tuple[Timeline, View, MinuteRun | None, np.ndarray]:
+    """The run's timeline, what its strategy reads, the minute run behind a minute timeline, and the bars of its curve:
+    every bar from the start on the daily timeline, each session's last on minute timelines (§11.7)."""
+    if config.timeframe == "1d":
+        minute_bars = tuple(_session_bars(config, data, adjusted=True)) if _reads_features(config) else None
+        timeline = daily_timeline(data.aligned, data.start)
+        return timeline, view(data, minute_bars), None, np.arange(data.start, len(timeline.time))
+    intraday = config.intraday
+    minute = minute_timeline(config.market, config.timeframe, data.aligned, data.minutes, data.covered, config.start,
+                             intraday["close_out"], intraday["close_out_minutes"])
+    timeline = minute.timeline
+    return timeline, minute_view(minute, data), minute, session_end_bars(timeline.session, timeline.start)
+
+
+def lookahead(config: RunConfig, data: RunData, strategy: StrategyFactory) -> dict | None:
+    """LOOKAHEAD_SUSPECT's detail for a vectorized plugin on the run's data, or None (§9.7)."""
+    return _lookahead(strategy, _prepare(config, data)[1]) if isinstance(strategy, PluginStrategy) else None
+
+
+def _lookahead(strategy: StrategyFactory, strategy_view: View) -> dict | None:
+    return strategy.lookahead(strategy_view) if isinstance(strategy, PluginStrategy) else None
+
+
+def _flattened(timeline: Timeline) -> Timeline:
+    """The engine's close-out on the last bar closes every position at its close, with costs."""
+    marks = np.zeros(len(timeline.time), dtype=np.int8) if timeline.closeout is None else timeline.closeout.copy()
+    marks[-1] = max(marks[-1], 1)
+    return replace(timeline, closeout=marks)
+
+
+def window(config: RunConfig, data: RunData, first: int, stop: int,
+           capital: float | None = None) -> tuple[RunConfig, RunData]:
+    """A run of the loaded rows [first, stop) (§13.4): the 300 rows before first are its warm-up, as in any backtest,
+    and equity starts on row first at the initial capital, or at capital. A minute run needs minute coverage for
+    every symbol in the window (§11.2)."""
+    days = data.aligned.days
+    start, end = int(days[first]), int(days[stop - 1])
+    capital = config.initial_capital if capital is None else capital
+    document = {**config.document, "start": _iso(start), "end": _iso(end), "initial_capital": capital}
+    windowed = replace(config, document=document, start=start, end=end, initial_capital=capital)
+    if config.timeframe != "1d":
+        _require_minutes(windowed, data.covered, end)
+    begin = max(0, first - WARMUP_BARS)
+    part = replace(data, aligned=_rows(data.aligned, begin, stop), benchmark=_rows(data.benchmark, begin, stop),
+                   rf=data.rf[begin:stop], start=first - begin)
+    return windowed, part
+
+
+def _rows(aligned: Aligned, begin: int, stop: int) -> Aligned:
+    return replace(aligned, **{item.name: value[begin:stop] for item in fields(aligned)
+                               if isinstance(value := getattr(aligned, item.name), np.ndarray)})
 
 
 def minute_view(minute: MinuteRun, data: RunData) -> View:

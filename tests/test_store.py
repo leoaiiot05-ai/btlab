@@ -468,6 +468,20 @@ def test_rules_are_stored_by_unique_name(store):
     assert [r.name for r in store.rules()] == ["alpha"]
 
 
+def test_optimizations_are_saved_listed_and_deleted(store):
+    results = {"paths": ["strategy.params.fast"], "combinations": [{"values": [5], "metrics": {"sharpe": 1.5}, "error": None}]}
+    grid = store.save_optimization(T0, "grid", "US", "GRID", "DONE", {"mode": "GRID"}, results, {"index": 0},
+                                   {"SURVIVORSHIP": None})
+    walk = store.save_optimization(at(1), "walk", "TW", "WFO", "CANCELLED", {"mode": "WFO"}, {"windows": []}, None, {})
+    row = store.optimization(grid)
+    assert (row.created_at, row.name, row.market, row.mode, row.status) == (T0, "grid", "US", "GRID", "DONE")
+    assert (row.config, row.results, row.best, row.flags) == ({"mode": "GRID"}, results, {"index": 0}, {"SURVIVORSHIP": None})
+    assert [(r.id, r.best, r.results) for r in store.optimizations()] == [(walk, None, None), (grid, {"index": 0}, None)]
+    assert [r.id for r in store.optimizations("US")] == [grid]
+    assert store.delete_optimization(grid) and not store.delete_optimization(grid)
+    assert store.optimization(grid) is None
+
+
 def test_unknown_lists_are_reported(store):
     assert not store.rename_list(7, "x")
     assert not store.set_list_symbols(7, ["SPY"])

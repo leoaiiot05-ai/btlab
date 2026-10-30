@@ -67,6 +67,17 @@ class Builtin:
     check: Callable[[dict], list[tuple[str, str]]] = field(default=lambda params: [])
 
 
+@dataclass(frozen=True, eq=False)
+class BuiltinStrategy:
+    """A built-in with its parameter values as a run's strategy. Plain data, so it pickles for a pool worker."""
+
+    id: str
+    params: dict
+
+    def __call__(self, view: View) -> "Targets | OrderStrategy":
+        return BUILTINS[self.id].run(view, self.params)
+
+
 # ----- schemas -----
 
 

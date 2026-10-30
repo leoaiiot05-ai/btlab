@@ -266,6 +266,23 @@ class BacktestRow:
 
 
 @dataclass(frozen=True)
+class OptimizationRow:
+    """A saved optimization (§13.7, §18); config, results, best and flags are JSON. Listings leave results out
+    (None)."""
+
+    id: int
+    created_at: datetime
+    name: str
+    market: str
+    mode: str
+    status: str
+    config: dict
+    best: dict | None
+    flags: dict
+    results: dict | None
+
+
+@dataclass(frozen=True)
 class RuleRow:
     """A stored rule (§9.6, §18): its unique name and its JSON."""
 

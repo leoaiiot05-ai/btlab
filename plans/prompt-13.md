@@ -60,3 +60,11 @@ Covers SPEC.md §9.7, §13 and §24.3. Acceptance: AC-16, AC-17 and the optimiza
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-16 and AC-17 hold, and the optimization part of AC-29.** `.venv/bin/python -m pytest -q`: 1008 passed (also with `-X dev -W error`, which the spawned workers of the real-pool test inherit).
+- Built as planned. Every strategy is now picklable (`BuiltinStrategy`, `RuleStrategy`, `PluginStrategy`), so tasks carry their strategy to the workers.
+- OOS is one train/test window and WFO a list of them; both, and GRID, are validated against the loaded period before the estimate runs.
+- Scaled-down timings of the bench's own functions here (not `python -m btlab.bench`): one daily run of 50 symbols × 10 years took 0.8 s (so about 2.5 s for 30 years, target 5 s); one 1-minute run of 10 symbols × 3 months took 1.5 s (so about 18 s for 3 years, target 60 s). Case 2 depends on the PC's cores: about 2,000 × 2.5 s / workers.
+- **For prompts 14 and 16:** the job runs `parse_request` (400 INVALID_FIELD or TOO_MANY_COMBOS), loads with `load_run(store, minute_store, request.config)`, then `optimize(request, data, taxes, process_pool(default_workers()), default_workers(), progress=..., cancelled=...)`; a `NeedsConfirmation` becomes 409 with `estimate_seconds`, and an `Optimization` is saved with `store.save_optimization(..., request.document, ...)`. `heatmap(row.config, row.results, x, y)` and `combination_config(row.config["config"], list(row.config["ranges"]), values)` serve the heatmap and promote routes. OptimizeError PERIOD_TOO_SHORT fails the job with its message.
