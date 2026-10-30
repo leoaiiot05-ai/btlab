@@ -265,6 +265,16 @@ class BacktestRow:
     opened_at: datetime | None
 
 
+@dataclass(frozen=True)
+class RuleRow:
+    """A stored rule (§9.6, §18): its unique name and its JSON."""
+
+    id: int
+    name: str
+    rule: dict
+    updated_at: datetime
+
+
 @dataclass(frozen=True, eq=False)
 class MinuteBars:
     """One symbol's 1-minute bars of the regular session in raw prices, ordered by t (§6.6)."""

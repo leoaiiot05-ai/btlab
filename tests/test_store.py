@@ -450,6 +450,24 @@ def test_list_names_are_unique_and_symbols_appear_once(store):
     assert [(l.name, l.symbols) for l in store.lists()] == [("mine", ()), ("other", ())]
 
 
+def test_rules_are_stored_by_unique_name(store):
+    breakout = store.create_rule("breakout", {"version": 1, "side": "long"}, T0)
+    fade = store.create_rule("fade", {"version": 1, "side": "short"}, T0)
+    with pytest.raises(StoreError) as caught:
+        store.create_rule("fade", {"version": 1}, T0)
+    assert caught.value.conflict
+    assert store.update_rule(breakout, "alpha", {"version": 1, "side": "short"}, at(5))
+    with pytest.raises(StoreError) as caught:
+        store.update_rule(breakout, "fade", {"version": 1}, T0)
+    assert caught.value.conflict
+    assert [(r.id, r.name, r.rule, r.updated_at) for r in store.rules()] == [
+        (breakout, "alpha", {"version": 1, "side": "short"}, at(5)), (fade, "fade", {"version": 1, "side": "short"}, T0)
+    ]
+    assert store.delete_rule(fade) and not store.delete_rule(fade)
+    assert not store.update_rule(fade, "gone", {}, T0)
+    assert [r.name for r in store.rules()] == ["alpha"]
+
+
 def test_unknown_lists_are_reported(store):
     assert not store.rename_list(7, "x")
     assert not store.set_list_symbols(7, ["SPY"])

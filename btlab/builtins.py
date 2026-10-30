@@ -12,6 +12,7 @@ import numpy as np
 from btlab import indicators
 from btlab.calendar import period_starts
 from btlab.engine import Book, OrderStrategy, Targets
+from btlab.features import SessionBars
 from btlab.indicators import Inputs
 from btlab.params import Param
 
@@ -22,10 +23,20 @@ DCA_AMOUNT = {"US": 1_000.0, "TW": 30_000.0}
 
 
 @dataclass(frozen=True, eq=False)
+class Daily:
+    """A minute timeline's daily bars, adjusted, with their days. Strategies read them only through the last completed
+    session before each bar's own (§8.4)."""
+
+    days: np.ndarray
+    bars: Inputs
+
+
+@dataclass(frozen=True, eq=False)
 class View:
     """What a strategy reads: the run's adjusted bars from the warm-up on, their tradable flags (§6.5), the DTB3 rate
     in percent per bar, and the first trading bar. days holds each bar's session day. Minute timelines add each bar's
-    UTC epoch second (times), its session index and the daily bars of the previous session (§8.4)."""
+    UTC epoch second (times), its session index and the run's daily bars (§8.4). minute_bars holds each symbol's
+    1-minute bars by day on the daily timeline, adjusted, when the strategy reads features (§8.2)."""
 
     symbols: tuple[str, ...]
     days: np.ndarray
@@ -35,7 +46,8 @@ class View:
     start: int
     times: np.ndarray | None = None
     session: np.ndarray | None = None
-    daily: Inputs | None = None
+    daily: Daily | None = None
+    minute_bars: tuple[SessionBars, ...] | None = None
 
 
 Schema = dict[str, Param]

@@ -16,6 +16,7 @@ import numpy as np
 
 from btlab.builtins import View
 from btlab.engine import Book, OrderStrategy, Targets
+from btlab.features import previous_session
 from btlab.indicators import Inputs
 from btlab.params import Param, parse_schema
 
@@ -139,9 +140,10 @@ class Bars:
         )
         self.tradable = _readonly(view.tradable)
         self.rf = _readonly(view.rf)
-        self.daily = None if view.daily is None else Inputs(
-            *(_readonly(getattr(view.daily, name)) for name in ("open", "high", "low", "close", "volume"))
-        )
+        self.daily = None if view.daily is None else Inputs(*(
+            _readonly(previous_session(view.daily.days, getattr(view.daily.bars, name), view.days))
+            for name in ("open", "high", "low", "close", "volume")
+        ))
         self._series = dict(series or {})
 
     def ext(self, name: str) -> np.ndarray:
@@ -261,7 +263,8 @@ def lookahead_check(signals: Callable, output: str, view: View, params: Mapping[
 
 
 def _cut(view: View, rows: int) -> View:
-    """The view's first rows bars."""
+    """The view's first rows bars. A minute timeline's daily bars stay whole: bars read them only through the previous
+    session (§8.4)."""
     return replace(view, **{
         item.name: _head(value, rows) for item in fields(view)
         if isinstance(value := getattr(view, item.name), (np.ndarray, Inputs))

@@ -72,3 +72,10 @@ Covers SPEC.md §8 (the operands a rule reads) and §9.6. Acceptance: AC-14.
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-14 holds.** `.venv/bin/python -m pytest -q`: 968 passed (also with `-X dev -W error`). `rules` joined the pure modules of `tests/test_purity.py`.
+- Built as planned. `View.daily` is now `Daily(days, bars)`; plugins still see `bars.daily` aligned to the previous session, and the look-ahead check leaves the daily bars whole because they are read only through it.
+- Identical operands (after parameter substitution) are computed once per evaluation, so entry and exit sharing indicators cost one computation.
+- **For prompts 13, 15–17 and 20:** `RuleStrategy` pickles as plain data; `validate_rule(rule, series)` returns `RuleIssue(code, path, message)` for `POST /api/rules/validate` and RULE_INVALID; `schema(rule)` gives the parameters for optimization ranges; `operands_of(rule)` finds series operands for IN_SAMPLE_SERIES; `directions(rule, params, view, series)` takes the aligned series once prompt 20 loads them; the store has `create_rule`, `update_rule`, `delete_rule` and `rules()`.

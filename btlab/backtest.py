@@ -15,12 +15,12 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from btlab.builtins import BUILTINS, View
+from btlab.builtins import BUILTINS, Daily, View
 from btlab.calendar import session
 from btlab.costs import CostModel
 from btlab.engine import EngineResult, OrderStrategy, Settings, Targets, daily_timeline, simulate
 from btlab.exits import DailyMinutePaths, ExitRules, Overlays
-from btlab.features import session_bars
+from btlab.features import SessionBars, session_bars
 from btlab.indicators import TRADING_DAYS_PER_YEAR, Inputs
 from btlab.intraday import (
     TIMEFRAME_MINUTES,
@@ -46,6 +46,8 @@ from btlab.params import validate_params
 from btlab.plugins import Plugin, PluginStrategy
 from btlab.prices import Aligned, align
 from btlab.records import MinuteBars, ShortSuspension, Trade, to_date, to_day
+from btlab.rules import RuleStrategy, operands_of, validate_rule
+from btlab.rules import schema as rule_schema
 from btlab.sizing import SIZING_MODES, Sizing
 from btlab.store import MinuteStore, Store
 from btlab.taxes import TaxTable
@@ -54,8 +56,7 @@ from btlab.taxes import TaxTable
 WARMUP_BARS = 300
 TIMEFRAMES = ("1d", *TIMEFRAME_MINUTES)
 CLOSE_OUTS = ("NONE", "SESSION_END")
-# Plugins (prompt 10) and rules (prompt 12) add their sources.
-STRATEGY_SOURCES = ("builtin", "plugin")
+STRATEGY_SOURCES = ("builtin", "plugin", "rule")
 PRICE_MODES = ("REALISTIC", "ADJUSTED")
 FILL_TIMINGS = ("NEXT_OPEN", "SAME_CLOSE")
 INTRABAR_PATHS = ("DAILY", "MINUTE")
@@ -115,7 +116,8 @@ class RunConfig:
 class RunData:
     """What a run reads, loaded from the stores. aligned holds the run's symbols from the warm-up on, start is the first
     bar of trading, rf the DTB3 rate in force on each day (§12), categories and borrow_fee_pct each symbol's settings
-    (§7, None for the run's default). minutes and covered serve the MINUTE intrabar path."""
+    (§7, None for the run's default). minutes and covered serve minute timelines, the MINUTE intrabar path and
+    features (§8.2)."""
 
     aligned: Aligned
     start: int
@@ -171,7 +173,8 @@ def validate_config(raw: Any, plugins: Mapping[str, Plugin] | None = None) -> Ru
         errors.append(("end", "must not be before start"))
     timeframe = top.get("timeframe", _choice(*TIMEFRAMES), "1d")
     intraday = _intraday(timeframe, raw.get("intraday"), errors)
-    strategy = _strategy(raw.get("strategy"), errors, market, symbols, timeframe, plugins or {})
+    strategy = _strategy(raw.get("strategy"), errors, market, symbols, timeframe, plugins or {},
+                         raw.get("allow_short") is True)
     sizing = _sizing(raw.get("sizing", {"mode": "FIXED_FRACTION"}), errors)
     exits = _exits(raw.get("exits", {}), errors)
     costs = _costs(market, raw.get("costs", {}), errors)
@@ -345,13 +348,16 @@ def _symbols(market: str, value: Any, errors: list[tuple[str, str]]) -> tuple[st
 
 
 def _strategy(value: Any, errors: list[tuple[str, str]], market: str, symbols: tuple[str, ...], timeframe: str | None,
-              plugins: Mapping[str, Plugin]) -> dict:
+              plugins: Mapping[str, Plugin], allow_short: bool) -> dict:
     """The source, its id and its parameters, checked against the strategy's schema (§9.2) and stored complete."""
     if value is None:
         errors.append(("strategy", "is required"))
         return {}
-    fields = _Object(value, "strategy", errors, {"source", "id", "params"})
+    rule = isinstance(value, dict) and value.get("source") == "rule"
+    fields = _Object(value, "strategy", errors, {"source", "id", "params", *(("rule",) if rule else ())})
     source = fields.get("source", _choice(*STRATEGY_SOURCES))
+    if source == "rule":
+        return _rule(fields, errors, timeframe, allow_short)
     strategy_id = fields.get("id", _text)
     params = fields.get("params", _object, {})
     if strategy_id is None or params is None:
@@ -375,20 +381,54 @@ def _strategy(value: Any, errors: list[tuple[str, str]], market: str, symbols: t
     return {"source": source, "id": strategy_id, "params": params}
 
 
+def _rule(fields: _Object, errors: list[tuple[str, str]], timeframe: str | None, allow_short: bool) -> dict:
+    """A rule run carries the complete rule (§10.1); its own errors keep their codes (§9.6) under strategy.rule. id is
+    the stored rule's name, when there is one."""
+    rule = fields.get("rule", _object)
+    document = {"source": "rule", "id": fields.get("id", _optional(_text), None), "rule": rule,
+                "params": fields.get("params", _object, {})}
+    if rule is None or document["params"] is None:
+        return document
+    issues = validate_rule(rule)
+    errors.extend((f"strategy.rule.{issue.path}" if issue.path else "strategy.rule", f"{issue.code}: {issue.message}")
+                  for issue in issues)
+    if issues:
+        return document
+    document["params"], found = validate_params(rule_schema(rule), document["params"], "strategy.params")
+    errors.extend(found)
+    if timeframe is not None and rule["timeframe"] != timeframe:
+        errors.append(("timeframe", f"must be {rule['timeframe']}, the rule's timeframe"))
+    if rule["side"] == "short" and not allow_short:
+        errors.append(("allow_short", "must be true for a short rule"))
+    return document
+
+
 def strategy_factory(config: RunConfig, plugins: Mapping[str, Plugin] | None = None) -> StrategyFactory:
     """The strategy run_backtest takes, for a validated configuration."""
     strategy = config.strategy
     if strategy["source"] == "plugin":
         return PluginStrategy(plugins[strategy["id"]], strategy["params"])
+    if strategy["source"] == "rule":
+        return RuleStrategy(strategy["rule"], strategy["params"])
     builtin = BUILTINS[strategy["id"]]
     return lambda strategy_view: builtin.run(strategy_view, strategy["params"])
 
 
-def view(data: RunData) -> View:
-    """What a strategy reads: the adjusted bars from the warm-up on (§10.2)."""
+def view(data: RunData, minute_bars: tuple[SessionBars, ...] | None = None) -> View:
+    """What a strategy reads: the adjusted bars from the warm-up on (§10.2), with each symbol's minute bars by day for
+    a strategy that reads features (§8.2)."""
     aligned = data.aligned
-    bars = Inputs(aligned.adj_open, aligned.adj_high, aligned.adj_low, aligned.adj_close, aligned.adj_volume)
-    return View(aligned.symbols, aligned.days, bars, aligned.tradable, data.rf, data.start)
+    return View(aligned.symbols, aligned.days, _adjusted(aligned), aligned.tradable, data.rf, data.start,
+                minute_bars=minute_bars)
+
+
+def _adjusted(aligned: Aligned) -> Inputs:
+    return Inputs(aligned.adj_open, aligned.adj_high, aligned.adj_low, aligned.adj_close, aligned.adj_volume)
+
+
+def _reads_features(config: RunConfig) -> bool:
+    strategy = config.strategy
+    return strategy["source"] == "rule" and any("feature" in operand for operand in operands_of(strategy["rule"]))
 
 
 def _object(value: Any) -> dict:
@@ -525,7 +565,7 @@ def load_run(store: Store, minute_store: MinuteStore | None, config: RunConfig) 
         },
     }
     minute_run = config.timeframe != "1d"
-    if (minute_run or config.intrabar_path == "MINUTE") and minute_store is not None:
+    if (minute_run or config.intrabar_path == "MINUTE" or _reads_features(config)) and minute_store is not None:
         covered = tuple(
             np.array([c.day for c in minute_store.minute_coverage(market, s, int(days[0]), int(days[-1])) if c.status == "OK"],
                      dtype=np.int64)
@@ -571,7 +611,9 @@ def run_backtest(config: RunConfig, data: RunData, taxes: TaxTable | None, strat
     settings = _settings(config, costs, data.suspensions)
     minute = None
     if config.timeframe == "1d":
-        timeline, strategy_view, paths = daily_timeline(data.aligned, data.start), view(data), _minute_paths(config, data)
+        minute_bars = tuple(_session_bars(config, data, adjusted=True)) if _reads_features(config) else None
+        timeline, strategy_view = daily_timeline(data.aligned, data.start), view(data, minute_bars)
+        paths = _minute_paths(config, data)
         points = np.arange(data.start, len(timeline.time))
     else:
         intraday = config.intraday
@@ -619,14 +661,14 @@ def run_backtest(config: RunConfig, data: RunData, taxes: TaxTable | None, strat
 
 def minute_view(minute: MinuteRun, data: RunData) -> View:
     """What a strategy reads on a minute timeline: the adjusted bars with their sessions, real-bar marks and minutes
-    since the open (§8.3), VOLATILITY's P of 252 × bars per session (§8.1), and the previous session's daily bars."""
+    since the open (§8.3), VOLATILITY's P of 252 × bars per session (§8.1), and the run's daily bars (§8.4)."""
     timeline = minute.timeline
     bars = Inputs(timeline.adj_open, timeline.adj_high, timeline.adj_low, timeline.adj_close, minute.volume,
                   periods_per_year=TRADING_DAYS_PER_YEAR * minute.bars_per_session, session=timeline.session,
                   real=minute.real, minutes=minute.minutes)
     rf = data.rf[np.searchsorted(data.aligned.days, timeline.day)]
     return View(timeline.symbols, timeline.day, bars, timeline.tradable, rf, timeline.start, times=timeline.time,
-                session=timeline.session, daily=minute.daily)
+                session=timeline.session, daily=Daily(data.aligned.days, _adjusted(data.aligned)))
 
 
 def _cost_model(config: RunConfig, categories: tuple[str, ...], borrow: tuple[float | None, ...], taxes: TaxTable | None) -> CostModel:
@@ -652,17 +694,21 @@ def _minute_paths(config: RunConfig, data: RunData) -> DailyMinutePaths | None:
     """Minute paths for intrabar_path MINUTE: raw in REALISTIC mode, scaled to the adjusted series in ADJUSTED mode."""
     if config.intrabar_path != "MINUTE":
         return None
+    return DailyMinutePaths(_session_bars(config, data, adjusted=config.price_mode == "ADJUSTED"))
+
+
+def _session_bars(config: RunConfig, data: RunData, adjusted: bool) -> list[SessionBars]:
+    """Each symbol's 1-minute bars by day, raw or scaled to the adjusted series (§8.2). Without a minute store nothing
+    is covered: every position-day falls back to the daily path, and features are NaN."""
     aligned = data.aligned
     count = len(aligned.symbols)
-    # Without a minute store nothing is covered, and every position-day falls back to the daily path.
     nothing = MinuteBars(np.zeros(0, dtype=np.int64), *(np.zeros(0) for _ in range(5)))
     minutes = data.minutes or (nothing,) * count
     covered = data.covered or (np.zeros(0, dtype=np.int64),) * count
-    realistic = config.price_mode == "REALISTIC"
-    return DailyMinutePaths([
-        session_bars(config.market, aligned.days, bars, days, np.ones(len(aligned.days)) if realistic else aligned.multiplier[:, j])
+    return [
+        session_bars(config.market, aligned.days, bars, days, aligned.multiplier[:, j] if adjusted else np.ones(len(aligned.days)))
         for j, (bars, days) in enumerate(zip(minutes, covered))
-    ])
+    ]
 
 
 @dataclass(frozen=True, eq=False)

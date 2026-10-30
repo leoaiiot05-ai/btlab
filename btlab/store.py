@@ -33,6 +33,7 @@ from btlab.records import (
     MinuteBars,
     MinuteCoverage,
     RiskFreeRates,
+    RuleRow,
     ShortSuspension,
     SymbolInfo,
     SymbolList,
@@ -645,6 +646,35 @@ class Store(_Database):
     def _setting(self, key: str) -> Any:
         rows = self._read("SELECT value FROM settings WHERE key = ?", (key,))
         return json.loads(rows[0][0]) if rows else None
+
+    # ----- rules (§9.6) -----
+
+    def create_rule(self, name: str, rule: dict, updated_at: datetime) -> int:
+        """A name already in use raises StoreError with conflict."""
+        with self._write() as db:
+            cursor = db.execute(
+                "INSERT INTO rules (name, body, updated_at) VALUES (?, ?, ?)", (name, _json(rule), _iso(updated_at))
+            )
+        return cursor.lastrowid
+
+    def update_rule(self, rule_id: int, name: str, rule: dict, updated_at: datetime) -> bool:
+        """False for an unknown rule; a name another rule uses raises StoreError with conflict."""
+        with self._write() as db:
+            cursor = db.execute(
+                "UPDATE rules SET name = ?, body = ?, updated_at = ? WHERE id = ?",
+                (name, _json(rule), _iso(updated_at), rule_id),
+            )
+        return cursor.rowcount == 1
+
+    def delete_rule(self, rule_id: int) -> bool:
+        with self._write() as db:
+            cursor = db.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
+        return cursor.rowcount == 1
+
+    def rules(self) -> list[RuleRow]:
+        """Every rule, by name."""
+        rows = self._read("SELECT id, name, body, updated_at FROM rules ORDER BY name")
+        return [RuleRow(id_, name, json.loads(body), _moment(updated_at)) for id_, name, body, updated_at in rows]
 
     # ----- backtest results (§10.11, §17.5) -----
 

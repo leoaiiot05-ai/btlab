@@ -8,7 +8,7 @@ import pytest
 BTLAB = Path(__file__).resolve().parents[1] / "btlab"
 # Pure modules as they arrive; later prompts add theirs. records.py holds the shared records (plan of prompt 2).
 PURE = ["markets", "records", "calendar", "prices", "indicators", "features", "registry", "costs", "sizing", "engine",
-        "exits", "metrics", "params", "builtins", "intraday"]
+        "exits", "metrics", "params", "builtins", "intraday", "rules"]
 # taxes.py reads its file once at startup; its TaxTable is pure, so pure modules may use it (SPEC.md §2).
 PURE_AFTER_LOADING = ["taxes"]
 PURE_IMPORTS = {

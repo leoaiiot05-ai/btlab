@@ -9,8 +9,6 @@ import numpy as np
 
 from btlab.calendar import session
 from btlab.engine import Timeline
-from btlab.features import previous_session
-from btlab.indicators import TRADING_DAYS_PER_YEAR, Inputs
 from btlab.markets import MARKETS
 from btlab.prices import Aligned
 from btlab.records import MinuteBars, Trade, to_day
@@ -43,15 +41,14 @@ def resample(bars: MinuteBars, opens: np.ndarray, minutes: int) -> MinuteBars:
 
 @dataclass(frozen=True, eq=False)
 class MinuteRun:
-    """A minute timeline and what goes with it: volume is adjusted, real marks the bars a symbol has, minutes counts from the session's
-    open to each bar's end, daily holds the previous session's daily bars per bar (§8.4), session_days and
-    session_ends describe the sessions, and bars_per_session sets VOLATILITY's P (§8.1)."""
+    """A minute timeline and what goes with it: volume is adjusted, real marks the bars a symbol has, minutes counts
+    from the session's open to each bar's end, session_days and session_ends describe the sessions, and
+    bars_per_session sets VOLATILITY's P (§8.1)."""
 
     timeline: Timeline
     volume: np.ndarray
     real: np.ndarray
     minutes: np.ndarray
-    daily: Inputs
     session_days: np.ndarray
     session_ends: np.ndarray
     bars_per_session: float
@@ -124,8 +121,6 @@ def minute_timeline(
         tradable=tradable, lock=daily.lock[daily_index], cash=cash, ratio=ratio, start=first_bar,
         closeout=_closeout(sessions, bar_ends, ends, close_out_minutes) if close_out == "SESSION_END" else None,
     )
-    previous = {name: previous_session(daily.days, getattr(daily, f"adj_{name}"), timeline_days)
-                for name in ("open", "high", "low", "close", "volume")}
     spec = MARKETS[market].session
     regular = (spec.close.hour * 60 + spec.close.minute) - (spec.open.hour * 60 + spec.open.minute)
     per_session = math.ceil(regular / TIMEFRAME_MINUTES[timeframe])
@@ -133,7 +128,7 @@ def minute_timeline(
                       axis=1) if sources else np.zeros((len(times), 0, 2), dtype=np.int64)
     return MinuteRun(
         timeline=timeline, volume=adjusted["volume"], real=real, minutes=(bar_ends - opens[sessions]) / MINUTE_S,
-        daily=Inputs(**previous, periods_per_year=TRADING_DAYS_PER_YEAR), session_days=days, session_ends=ends,
+        session_days=days, session_ends=ends,
         bars_per_session=per_session, slices=slices, sources=tuple(sources), multiplier=multiplier,
     )
 
