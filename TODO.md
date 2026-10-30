@@ -42,3 +42,4 @@ Nothing here is in scope for v1. Do not build any of it without being asked. App
 - [ ] Format checks for URLs and email addresses in `config.toml`; today a malformed one fails at its first use. Seam: the per-key validators in `config.py`.
 - [ ] Retention for the `events` and `job_runs` tables; today both keep every row (a few thousand a year). Seam: `append_event` and `start_job_run` in `store.py`.
 - [ ] Schema upgrades for the databases; today the store creates schema version 1 and refuses a file with a newer `user_version`. Seam: where `store._Database` reads `user_version`.
+- [ ] `Retry-After` as an HTTP date; today it counts as the 60 s default. Seam: `_retry_after` in `http.py`.
