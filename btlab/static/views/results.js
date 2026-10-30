@@ -139,6 +139,12 @@ function actions(detail, context, message) {
       message.textContent = errorText(error);
     }
   };
+  // The Live view opens with this result chosen in its forms (§20.2 item 5).
+  const live = (label) => button(t(label), () => {
+    context.liveSeed = detail.id;
+    context.go("live");
+  });
+  const guarded = detail.config.exits && detail.config.exits.ibguard && context.state.app.services.ibguard.configured;
   return h("section", {class: "actions"},
     name, button(t("results.rename"), () => change({name: name.value})),
     h("label", {class: "switch"}, checkbox(detail.keep_offline, (on) => change({keep_offline: on})), h("span", {text: t("results.keep_offline")})),
@@ -148,6 +154,8 @@ function actions(detail, context, message) {
       context.compareSeed = [detail.id];
       context.go("results");
     }),
+    detail.timeframe === "1d" ? live("results.use_live") : null,
+    detail.timeframe === "1d" && guarded ? live("results.write_ibguard") : null,
     button(t("results.delete"), async () => {
       if (!confirm(t("results.confirm_delete", {name: detail.name}))) return;
       try {

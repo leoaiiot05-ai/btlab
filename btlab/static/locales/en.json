@@ -536,6 +536,8 @@
  "results.trade_side": "Side",
  "results.trade_symbol": "Symbol",
  "results.trades": "Trades",
+ "results.use_live": "Use for a live portfolio",
+ "results.write_ibguard": "Write to ibguard…",
  "rule.BAD_ARGS": "Bad arguments",
  "rule.BAD_OP": "Bad operator",
  "rule.DEPTH": "Too deep: at most 3 levels",

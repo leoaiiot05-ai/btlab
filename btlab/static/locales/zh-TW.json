@@ -536,6 +536,8 @@
  "results.trade_side": "方向",
  "results.trade_symbol": "代號",
  "results.trades": "交易明細",
+ "results.use_live": "用於實盤組合",
+ "results.write_ibguard": "寫入 ibguard…",
  "rule.BAD_ARGS": "參數錯誤",
  "rule.BAD_OP": "比較運算錯誤",
  "rule.DEPTH": "層數過深：最多 3 層",

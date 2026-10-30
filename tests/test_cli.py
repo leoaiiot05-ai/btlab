@@ -121,6 +121,23 @@ def test_main_exits_before_any_database_while_another_process_holds_the_lock(tmp
     assert "another btlab process is running" in text and TOKEN not in text
 
 
+def test_an_unexpected_error_at_startup_reaches_the_log_file(tmp_path, monkeypatch, logging_sandbox):
+    """pythonw.exe, which the autostart runs, has no console: the log file must say why btlab stopped (§23)."""
+    call, _ = logging_sandbox
+    root = config_dir(tmp_path)
+
+    async def failing(config, taxes):
+        raise OSError("the port is in use")
+
+    monkeypatch.setattr(entry, "run", failing)
+    assert call(main, ["--config", str(root / "config.toml")]) == 1
+    text = (root / "logs" / "btlab.log").read_text(encoding="utf-8")
+    assert "btlab stopped on an unexpected error" in text and "OSError: the port is in use" in text
+    lock = take_lock(root / "data" / "btlab.lock")
+    assert lock is not None
+    lock.close()
+
+
 def test_a_lock_left_by_a_killed_process_does_not_block_a_restart(tmp_path):
     path = tmp_path / "data" / "btlab.lock"
     with held_lock(path):

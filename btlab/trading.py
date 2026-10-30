@@ -16,7 +16,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from btlab.config import Limits
-from btlab.http import SourceError
+from btlab.http import SourceError, redact
 from btlab.ibguard_client import EXITING, GuardState, IbguardClient
 from btlab.live import ENDED, apply_limits, batch_lines, cutoff, live_lot, rule_price
 from btlab.notifier import Notifier
@@ -306,13 +306,23 @@ class Trader:
     # ----- following orders (§15.5 to §15.9) -----
 
     def on_report(self, report: OrderReport) -> None:
-        """An order's new state from IB; orders without btlab's prefix are never btlab's concern (§15.8)."""
+        """An order's new state from IB; orders without btlab's prefix are never btlab's concern (§15.8). An
+        unexpected error stops the line's batch and is recorded (§15.9, §23): ib_async's event would only log it."""
         if not report.order_ref.startswith(PREFIX):
             return
         self._acknowledged.add(report.order_id)
-        line = self.store.order_by_ref(report.order_ref)
-        if line is not None:
-            self._apply(line, report)
+        line = None
+        try:
+            line = self.store.order_by_ref(report.order_ref)
+            if line is not None:
+                self._apply(line, report)
+        except Exception as error:
+            log.exception("the report on %s failed", report.order_ref)
+            if line is not None:
+                self._stopped.add(line.batch_id)
+            message = redact(f"{type(error).__name__}: {error}")
+            self.event("ERROR", "INTERNAL_ERROR", f"order report {report.order_ref}: {message}")
+            self._later(self.notifier.send("INTERNAL_ERROR", error=message))
 
     def _apply(self, line: LiveOrder, report: OrderReport, expire: bool = False) -> None:
         """A report on a line: its state and fill. An ended line keeps its end; a commission reported after the fill

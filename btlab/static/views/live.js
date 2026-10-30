@@ -24,6 +24,9 @@ export async function render(root, context) {
     return;
   }
   const services = context.state.app.services;
+  // A result page's "use for a live portfolio" or "write to ibguard" chose this backtest.
+  const seed = context.liveSeed;
+  context.liveSeed = null;
   if (context.state.app.mode === "trade" && !services.ibguard.configured) {
     root.append(h("p", {class: "warning", text: t("live.not_coordinated")}));
   }
@@ -31,10 +34,14 @@ export async function render(root, context) {
     const portfolio = portfolios.find((found) => found.market === market && found.active);
     root.append(h("section", {class: "card live-card"}, h("h3", {text: code("market", market)}),
       portfolio ? portfolioCard(portfolio, context, message)
-        : createForm(market, backtests.filter((found) => found.market === market && found.timeframe === "1d"), context, message)));
+        : createForm(market, backtests.filter((found) => found.market === market && found.timeframe === "1d"), seed, context, message)));
   }
-  if (services.ibguard.configured) root.append(ibguardPanel(backtests.filter((found) => found.timeframe === "1d")));
+  if (services.ibguard.configured) root.append(ibguardPanel(backtests.filter((found) => found.timeframe === "1d"), seed));
   update(root);
+}
+
+function initial(backtests, seed) {
+  return String(backtests.some((found) => found.id === seed) ? seed : backtests[0].id);
 }
 
 export function update(root) {
@@ -52,10 +59,10 @@ function countdown(iso) {
   return t("live.cutoff_left", {hours: Math.floor(left / 60), minutes: left % 60});
 }
 
-function createForm(market, backtests, context, message) {
+function createForm(market, backtests, seed, context, message) {
   if (!backtests.length) return h("p", {class: "quiet", text: t("live.no_daily")});
   const chosen = select(backtests.map((found) => [String(found.id), `${found.name} · ${moment(found.created_at)}`]),
-    String(backtests[0].id));
+    initial(backtests, seed));
   let capital = null;
   const amount = stepper(null, {min: 1, step: 1000, optional: true, onChange: (value) => { capital = value; }});
   const create = button(t("live.create"), async () => {
@@ -199,12 +206,12 @@ function history(portfolio) {
   return shown;
 }
 
-function ibguardPanel(backtests) {
+function ibguardPanel(backtests, seed) {
   // ibguard's STK thresholds from a backtest that used the ibguard rule: the preview, then a confirmed write (§16.3).
   const shown = h("div");
   const message = h("p", {class: "message", role: "alert"});
   if (!backtests.length) return h("section", {class: "card"}, h("h3", {text: t("ibguard.title")}), h("p", {class: "quiet", text: t("live.no_daily")}));
-  const chosen = select(backtests.map((found) => [String(found.id), `${found.name} · ${code("market", found.market)}`]), String(backtests[0].id));
+  const chosen = select(backtests.map((found) => [String(found.id), `${found.name} · ${code("market", found.market)}`]), initial(backtests, seed));
   const show = async () => {
     clear(shown);
     message.textContent = "";

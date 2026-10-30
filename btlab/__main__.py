@@ -60,6 +60,10 @@ def main(argv: list[str] | None = None) -> int:
         asyncio.run(run(config, taxes))
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # Under pythonw.exe, which the autostart runs, there is no console: the log file is the only witness.
+        log.exception("btlab stopped on an unexpected error")
+        return 1
     finally:
         lock.close()
     return 0

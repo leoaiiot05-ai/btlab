@@ -44,7 +44,7 @@ from btlab.spylead_client import SOURCE as SPYLEAD, SpyleadClient
 from btlab.store import MinuteStore, Store, StoreError
 from btlab.taxes import TaxTable
 from btlab.tiingo import TiingoClient
-from btlab.trading import TradeError, Trader
+from btlab.trading import WORKING, TradeError, Trader
 
 LANES = {"UPDATE_US": "DATA", "UPDATE_TW": "DATA", "SPYLEAD_SNAPSHOT": "DATA", "MINUTE_BACKFILL": "MINUTE",
          "BACKTEST": "COMPUTE", "OPTIMIZE": "COMPUTE", "LIVE_GENERATE": "LIVE", "LIVE_VIRTUAL_FILL": "LIVE",
@@ -211,6 +211,7 @@ class Jobs:
         self.session, self.clock, self.sleep = session, clock, sleep
         self.keep_awake = keep_awake or KeepAwake()
         self._jobs: dict[str, Job] = {}
+        self._orders_held = False
 
     def running(self) -> dict[str, dict]:
         """Each busy lane's job progress."""
@@ -319,6 +320,16 @@ class Jobs:
         if "LIVE" not in self._jobs and self.trader.unresolved():
             self.sweep()
 
+    def _awake_for_orders(self) -> None:
+        """Windows also stays awake while a btlab order works (§23): one hold on the jobs' own counter, because a
+        second counter's release would clear this one's request."""
+        working = bool(self.store.orders_with_status(*WORKING))
+        if working and not self._orders_held:
+            self.keep_awake.hold()
+        elif self._orders_held and not working:
+            self.keep_awake.release()
+        self._orders_held = working
+
     def next_session(self, market: str) -> int:
         """The session after the latest stored one (§4.3, §14.3)."""
         stored = self.store.daily_bars("US", "SPY").day if market == "US" else self.store.trading_days(market)
@@ -370,10 +381,11 @@ class Jobs:
         await asyncio.gather(*(job.task for job in jobs))
 
     def tick(self, schedule: ScheduleConfig) -> Job | None:
-        """Expires batches past their cutoff, starts trade mode's sweeps, then the first scheduled update that is due
-        (§17.4); a due update waits while the DATA lane is busy."""
+        """Expires batches past their cutoff, keeps the PC awake for trade mode's working orders and starts its
+        sweeps, then the first scheduled update that is due (§17.4); a due update waits while the DATA lane is busy."""
         self.expire()
         if self.trader is not None:
+            self._awake_for_orders()
             self._sweeps()
         if not schedule.enabled or "DATA" in self._jobs:
             return None
@@ -425,6 +437,9 @@ class Jobs:
             self.keep_awake.release()
             if not job.ready.done():
                 job.ready.set_result(None)
+        if self.trader is not None:
+            # Before anything else runs on the loop, so a sent order's hold follows its job's without a pause.
+            self._awake_for_orders()
         self.store.finish_job_run(run_id, self.now(), outcome, message)
         level, kind = ("INFO", _SAVED_EVENTS[job.kind]) if outcome == "DONE" else _END_EVENTS[outcome]
         self.event(level, kind, f"{job.kind} {outcome}" + (f": {message}" if message else ""), market)

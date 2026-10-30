@@ -6,7 +6,7 @@ IB is a fake OrderPort and AccountPort, ibguard an aiohttp test server on 127.0.
 
 import asyncio
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,9 +15,9 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from btlab import ib_orders
-from btlab.config import Limits, ServiceConfig, load_config
+from btlab.config import Limits, ScheduleConfig, ServiceConfig, load_config
 from btlab.ibguard_client import GuardState, GuardedPosition, connected, preview, thresholds_error
-from btlab.jobs import Jobs, KeepAwake, LiveError
+from btlab.jobs import SWEEP_KEY, Jobs, KeepAwake, LiveError
 from btlab.live import apply_limits, rule_price
 from btlab.records import Contract, Line, to_day
 from btlab.store import MinuteStore, Store
@@ -220,6 +220,33 @@ def test_a_read_only_api_stops_the_batch(market):
     assert [x.status for x in store.batch(batch_id).lines] == ["REJECTED", "NOT_SENT"]
     assert "READ_ONLY_API" in [e.kind for e in store.latest_events(5)]
     assert notes.sent[0] == ("READ_ONLY_API", {"batch": str(batch_id)})
+
+
+def test_a_failing_report_stops_the_batch_and_is_recorded(market, monkeypatch):
+    store = market
+    portfolio_id = portfolio_of(store)
+    batch_id = batch_of(store, portfolio_id, [proposed("AAA", "BUY", 10, 50.0), proposed("BBB", "BUY", 20, 40.0)])
+    orders, notes = FakeOrderPort(working), Notes()
+    trader = trader_of(store, orders, FakeAccount(), notes)
+    update = store.update_order
+
+    def failing(order_id, updated_at, **changes):
+        if changes.get("status") == "WORKING":
+            raise RuntimeError("the disk is full")
+        return update(order_id, updated_at, **changes)
+
+    monkeypatch.setattr(store, "update_order", failing)
+
+    async def go():
+        result = await trader.send(store.batch(batch_id), store.portfolio(portfolio_id))
+        await asyncio.sleep(0)
+        return result
+
+    assert asyncio.run(go()) == ("DONE", f"batch {batch_id}: sent 1, skipped 0")
+    assert [x.status for x in store.batch(batch_id).lines] == ["SENT", "NOT_SENT"]
+    (event,) = [e for e in store.latest_events(5) if e.kind == "INTERNAL_ERROR"]
+    assert event.message == f"order report {orders.placed[0].order_ref}: RuntimeError: the disk is full"
+    assert notes.sent == [("INTERNAL_ERROR", {"error": "RuntimeError: the disk is full"})]
 
 
 # ----- recovery, other orders, cancelling (§15.7, §15.8) -----
@@ -523,6 +550,25 @@ def test_confirming_in_trade_mode_sends_or_refuses(market, tmp_path):
     assert cancelling == (202, {"lane": "LIVE", "kind": "LIVE_CANCEL"}) and orders.cancelled == [1]
     assert state[1]["app"]["services"]["ibguard"] == {"configured": True, "reachable": None, "paused": None,
                                                       "account_kind": None}
+
+
+def test_the_pc_stays_awake_while_a_btlab_order_works(market, tmp_path):
+    """§23: the hold passes from the LIVE_SEND job to its working order, and ends at the tick after the fill."""
+    store = market
+    portfolio_id = portfolio_of(store)
+    batch_id = store.save_batch(portfolio_id, SESSION, NOW, {"AAA": 20.0}, [proposed("AAA", "SELL", 5, 50.0)])
+    store.save_setting(SWEEP_KEY.format(market="US"), to_day(NOW.date()))  # today's sweep is done
+
+    async def scenario(client, jobs, orders, account):
+        line = store.batch(batch_id).lines[0].id
+        await client.post(f"/api/live/batches/{batch_id}/confirm", json={"lines": [line]})
+        await idle(jobs)
+        working = (store.batch(batch_id).lines[0].status, jobs.keep_awake.holders)
+        orders.report(OrderReport(1, orders.placed[0].order_ref, 101, "FILLED", 5.0, 50.0, 1.0))
+        jobs.tick(ScheduleConfig(False, time(8, 30), time(18, 0)))
+        return working, (store.batch(batch_id).lines[0].status, jobs.keep_awake.holders)
+
+    assert serve(tmp_path, store, scenario) == (("WORKING", 1), ("FILLED", 0))
 
 
 def test_the_ibguard_preview_and_write(market, tmp_path):
