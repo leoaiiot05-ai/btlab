@@ -27,6 +27,7 @@ PREFIX = "btlab:"
 READ_ONLY_CODE = 321
 CANCELLED_CODE = 202
 ACK_TIMEOUT_S = 5.0
+RECONNECT_S, RECONNECT_MAX_S = 10.0, 60.0
 WORKING = ("SENT", "WORKING")
 # What btlab last saw of ibguard, for the state document (§19): btlab does not poll ibguard.
 IBGUARD_SEEN = "ibguard_seen"
@@ -332,7 +333,8 @@ class Trader:
         if state in ENDED:
             self.event("INFO", "ORDER_ENDED", f"{line.action} {line.symbol}: {state}, filled {report.filled:g}",
                        symbol=line.symbol)
-            self._later(self.resolve_exclusions())
+            if any(exclusion.order_id == line.id for exclusion in self.store.exclusions()):
+                self._later(self.resolve_exclusions())
             self._finish(line.batch_id)
 
     def _read_only(self, line: LiveOrder) -> None:
@@ -360,6 +362,28 @@ class Trader:
         task = asyncio.ensure_future(work)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    async def on_connect(self) -> None:
+        """At every connect: recovery, then the exclusions whose orders ended while btlab was away (§15.7, §16.2)."""
+        await self.recover()
+        await self.resolve_exclusions()
+
+    async def stay_connected(self, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
+        """While a btlab order works or an exclusion is active, a lost link reconnects after 10 s, doubling up to
+        60 s (§15.6)."""
+        delay = RECONNECT_S
+        while True:
+            await sleep(delay)
+            needed = self.store.orders_with_status(*WORKING) or self.store.exclusions()
+            if self.account.connected or not needed:
+                delay = RECONNECT_S
+                continue
+            try:
+                await self.account.connect()
+                delay = RECONNECT_S
+            except Exception as error:  # an IbError of any kind: try again later
+                log.warning("IB reconnect failed: %s", error)
+                delay = min(delay * 2, RECONNECT_MAX_S)
 
     async def recover(self) -> None:
         """At every connect: btlab's orders matched to their lines by exact orderRef (§15.7); one that matches none

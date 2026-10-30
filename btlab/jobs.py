@@ -254,7 +254,9 @@ class Jobs:
             raise LiveError("ALREADY_EXISTS", f"{market} already has an active {self.mode}-mode portfolio") from None
 
     def regenerate(self, portfolio: LivePortfolio) -> Job:
-        """A new batch now (§14.3); LiveError BATCH_LOCKED once the next session's batch is confirmed."""
+        """A new batch now (§14.3); LiveError BATCH_LOCKED once the next session's batch is confirmed, NOT_CONNECTED
+        in trade mode without IB."""
+        self._tradeable()
         latest = self.store.batches(portfolio.id, 1)
         if latest and latest[0].status != "PROPOSED" and latest[0].session_day >= self.next_session(portfolio.market):
             raise LiveError("BATCH_LOCKED", f"batch {latest[0].id} is {latest[0].status} and is never changed")
@@ -269,6 +271,7 @@ class Jobs:
         if batch.status != "PROPOSED" or self.now() >= cutoff(market, batch.session_day):
             raise LiveError("BATCH_EXPIRED", f"batch {batch.id} can no longer be confirmed")
         if self.mode == "trade":
+            self._tradeable()
             try:
                 self.trader.precheck(batch, market)
             except TradeError as refused:
@@ -279,6 +282,10 @@ class Jobs:
         if self.mode != "trade":
             return None
         return self._start("LIVE_SEND", lambda job: self.trader.send(self.store.batch(batch.id), portfolio), market=market)
+
+    def _tradeable(self) -> None:
+        if self.mode == "trade" and self.trader is None:
+            raise LiveError("NOT_CONNECTED", "trade mode needs IB: [ib] host is empty in config.toml")
 
     def cancel_orders(self, batch: LiveBatch, market: str) -> Job:
         """LIVE_CANCEL: btlab's own working orders of a batch (§15.8)."""
@@ -433,7 +440,7 @@ class Jobs:
         """After a market's update (§17.2): the virtual fills of the session just stored, then a new batch (test mode);
         and the minute bars: IB may be asked again (§5.4), and a backfill fetches the new sessions, or a running one
         picks them up after its pause."""
-        if self.store.active_portfolio(market, self.mode) is not None:
+        if self.store.active_portfolio(market, self.mode) is not None and (self.mode == "test" or self.trader is not None):
             self._live(self.virtual_fill if self.mode == "test" else self.generate, market)
         if self.ib is None:
             return

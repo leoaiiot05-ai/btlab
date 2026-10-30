@@ -6,21 +6,26 @@ import logging
 import sys
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import IO
 
+import aiohttp
 from aiohttp import web
 
 from btlab.config import Config, ConfigError, ScheduleConfig, load_config, startup_warnings
 from btlab.http import redact
 from btlab.ib_link import IbLink
+from btlab.ib_orders import IbOrders
+from btlab.ibguard_client import IbguardClient, connected
 from btlab.jobs import Jobs, Keys
-from btlab.notifier import make_notifier
+from btlab.notifier import Notifier, make_notifier
 from btlab.optimize import PoolFactory, default_workers, process_pool
 from btlab.plugins import PluginFolder
 from btlab.store import MinuteStore, Store
 from btlab.taxes import TaxTable, TaxTableError, load_taxes
+from btlab.trading import Trader
 from btlab.web import Services, make_app, start_site
 
 LOG_FILE_BYTES = 5 * 1024 * 1024
@@ -97,19 +102,27 @@ async def run(config: Config, taxes: TaxTable, stop: asyncio.Event | None = None
         workers = default_workers()
         # IB connects on demand, when a job first needs it (§22).
         ib = IbLink(config.ib, config.mode) if config.ib.host else None
+        notifier = make_notifier(config.email, config.mode)
+        trader = _trader(config, store, ib, notifier) if config.mode == "trade" and ib is not None else None
         jobs = Jobs(store, minute_store, Keys(config.tiingo.api_key, config.finmind.token, config.fred.api_key), taxes,
                     lambda: plugins.plugins, pool or process_pool(workers), workers,
-                    notifier=make_notifier(config.email, config.mode), spylead=config.spylead, ib=ib,
-                    backfill_years=config.minute.backfill_years, mode=config.mode, orders=config.orders)
+                    notifier=notifier, spylead=config.spylead, ib=ib, backfill_years=config.minute.backfill_years,
+                    mode=config.mode, orders=config.orders, trader=trader)
         app = make_app(Services(config, store, minute_store, jobs, plugins, time.time, notifier=jobs.notifier))
         runner = await (serve or (lambda found: start_site(found, config.web.port)))(app)
         log.info("web server listening on 127.0.0.1")
-        scheduler = asyncio.create_task(_schedule(jobs, config.schedule))
+        background = [asyncio.create_task(_schedule(jobs, config.schedule))]
+        if trader is not None:
+            # Recovery and the safety sweep at start and at every connect (§15.7, §16.2 step 7).
+            ib.on_connect = trader.on_connect
+            jobs.sweep()
+            background.append(asyncio.create_task(trader.stay_connected()))
         log.info("scheduler started; ready")
         try:
             await stop.wait()
         finally:
-            scheduler.cancel()
+            for task in background:
+                task.cancel()
             await runner.cleanup()
             log.info("web server stopped")
             await jobs.interrupt()
@@ -120,6 +133,15 @@ async def run(config: Config, taxes: TaxTable, stop: asyncio.Event | None = None
         store.close()
         minute_store.close()
         log.info("stores closed")
+
+
+def _trader(config: Config, store: Store, ib: IbLink, notifier: Notifier) -> Trader:
+    """Trade mode's orders on the link's connection (§15); test mode never constructs them (§15.1)."""
+    def guard() -> AbstractAsyncContextManager[IbguardClient]:
+        return connected(config.ibguard, aiohttp.ClientSession, asyncio.sleep, time.time)
+
+    return Trader(store, IbOrders(ib.port), ib, config.limits, ibguard=guard if config.ibguard.url else None,
+                  notifier=notifier, clock=time.time)
 
 
 async def _schedule(jobs: Jobs, schedule: ScheduleConfig) -> None:

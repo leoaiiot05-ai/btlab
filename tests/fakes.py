@@ -188,6 +188,128 @@ class FakeIB:
         return answer
 
 
+class FakeOrderPort:
+    """trading.py's OrderPort without IB: placed tickets are recorded and numbered from 1; answer(ticket, order_id)
+    may give IB's first report at once; report() sends any other; open and completed are IB's lists of orders."""
+
+    def __init__(self, answer: Callable[[Any, int], Any] | None = None) -> None:
+        self.answer = answer
+        self.placed: list = []
+        self.cancelled: list[int] = []
+        self.open: list = []
+        self.completed: list = []
+        self.handlers: list[Callable] = []
+
+    def place(self, ticket: Any) -> int:
+        self.placed.append(ticket)
+        order_id = len(self.placed)
+        first = self.answer(ticket, order_id) if self.answer else None
+        if first is not None:
+            self.report(first)
+        return order_id
+
+    def cancel(self, order_id: int) -> bool:
+        self.cancelled.append(order_id)
+        return True
+
+    def open_orders(self) -> list:
+        return list(self.open)
+
+    async def completed_orders(self) -> list:
+        return list(self.completed)
+
+    def on_report(self, handler: Callable) -> None:
+        self.handlers.append(handler)
+
+    def report(self, report: Any) -> None:
+        for handler in self.handlers:
+            handler(report)
+
+
+class FakeAccount:
+    """trading.py's AccountPort without IB: an account, positions by conId, contracts by symbol and price rules."""
+
+    def __init__(self, positions: dict[int, float] | None = None, contracts: dict | None = None,
+                 increments: dict[int, list] | None = None, account: str | None = "DU1234567") -> None:
+        self.connected, self.connects = True, 0
+        self.held, self.contracts, self.rules, self.account_id = dict(positions or {}), contracts or {}, increments or {}, account
+
+    async def connect(self) -> None:
+        self.connects += 1
+        self.connected = True
+
+    def account(self) -> str | None:
+        return self.account_id
+
+    def positions(self) -> dict[int, float]:
+        return {con_id: quantity for con_id, quantity in self.held.items() if quantity}
+
+    async def contract(self, market: str, symbol: str, exchange: str | None) -> Any:
+        if symbol not in self.contracts:
+            raise LookupError(f"IB knows no contract for {symbol}")
+        return self.contracts[symbol]
+
+    async def increments(self, rule_id: int) -> list | None:
+        return self.rules.get(rule_id)
+
+
+class FakeIbguard:
+    """ibguard's JSON API for an aiohttp test server on 127.0.0.1 (§24.1): a token login with a session cookie, the
+    state with its REAL positions, the STK thresholds and exclusions. Requests are recorded as (method, path, body);
+    sticky con_ids refuse to be excluded, failing paths answer 500."""
+
+    COOKIE = ("ibguard_session", "f00d")
+
+    def __init__(self, token: str, positions: list[dict] | None = None) -> None:
+        self.token = token
+        self.account, self.account_kind, self.paused = "DU1234567", "paper", False
+        self.thresholds = {"STK": {"tp_pct": 10.0, "sl_pct": 5.0}, "OPT": {"tp_pct": 50.0, "sl_pct": 30.0}}
+        self.positions = positions or []
+        self.sticky: set[int] = set()
+        self.failing: set[str] = set()
+        self.requests: list[tuple[str, str, Any]] = []
+
+    def app(self) -> web.Application:
+        @web.middleware
+        async def guard(request: web.Request, handler: Callable) -> web.StreamResponse:
+            body = await request.json() if request.can_read_body else None
+            self.requests.append((request.method, request.path, body))
+            if request.path in self.failing:
+                return web.json_response({"error": "INTERNAL"}, status=500)
+            if request.path != "/api/login" and request.cookies.get(self.COOKIE[0]) != self.COOKIE[1]:
+                return web.json_response({"error": "UNAUTHORIZED"}, status=401)
+            return await handler(request)
+
+        app = web.Application(middlewares=[guard])
+        app.router.add_post("/api/login", self._login)
+        app.router.add_get("/api/state", self._state)
+        app.router.add_post("/api/thresholds", self._thresholds)
+        app.router.add_post("/api/positions/REAL/{con_id}/exclude", self._exclude)
+        return app
+
+    async def _login(self, request: web.Request) -> web.Response:
+        if (await request.json()).get("token") != self.token:
+            return web.json_response({"error": "LOGIN_FAILED"}, status=401)
+        response = web.Response(status=204)
+        response.set_cookie(*self.COOKIE, httponly=True)
+        return response
+
+    async def _state(self, request: web.Request) -> web.Response:
+        return web.json_response({"account": self.account, "account_kind": self.account_kind, "paused": self.paused,
+                                  "thresholds": self.thresholds, "positions": self.positions})
+
+    async def _thresholds(self, request: web.Request) -> web.Response:
+        self.thresholds = {**self.thresholds, **await request.json()}
+        return web.Response(status=204)
+
+    async def _exclude(self, request: web.Request) -> web.Response:
+        con_id, excluded = int(request.match_info["con_id"]), (await request.json())["excluded"]
+        for position in self.positions:
+            if position["con_id"] == con_id and con_id not in self.sticky:
+                position["status"] = "EXCLUDED" if excluded else "ACTIVE"
+        return web.Response(status=204)
+
+
 class FakeTime:
     """An epoch-seconds clock that only the injected sleep moves. Every sleep is recorded."""
 

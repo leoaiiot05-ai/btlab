@@ -5,7 +5,6 @@ Stores are temporary, data synthetic, the clock injected and the pool in process
 """
 
 import asyncio
-import sys
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 
@@ -297,7 +296,7 @@ def test_data_incomplete_on_the_latest_session_makes_no_batch(market):
     assert [e.kind for e in store.latest_events(2)] == ["JOB_FAILED", "LIVE_DATA_INCOMPLETE"]
 
 
-def test_an_update_fills_then_generates_and_test_mode_needs_no_order_adapter(market):
+def test_an_update_fills_then_generates(market):
     store, backtest_id = market
     store.set_list_symbols(store.create_list("mine", "US", BEFORE_CUTOFF), ["AAA"])
     session = FakeSession(Answer(200, SPY), Answer(200, AAA), Answer(200, RATES))
@@ -313,7 +312,6 @@ def test_an_update_fills_then_generates_and_test_mode_needs_no_order_adapter(mar
     assert store.latest_job_runs("LIVE_VIRTUAL_FILL", 1)[0].outcome == "UPDATED"
     # BBB has no bar on the update's latest session.
     assert store.latest_job_runs("LIVE_GENERATE", 1)[0].message.startswith("LIVE_DATA_INCOMPLETE")
-    assert "btlab.ib_orders" not in sys.modules
 
 
 # ----- the routes (§19) -----
@@ -375,7 +373,7 @@ def test_the_live_routes_in_test_mode(market, tmp_path):
     assert found["regenerate"] == (202, {"lane": "LIVE", "kind": "LIVE_GENERATE"})
     assert found["state"][1]["live"]["US"] == {"portfolio_id": 1, "batch": {
         "id": batch.id, "status": "PROPOSED", "session": "2021-01-01", "cutoff": "2021-01-01T14:20:00Z", "lines": 2}}
-    assert found["confirm"] == (202, {"batch": batch.id, "status": "CONFIRMED"})
+    assert found["confirm"] == (202, {"batch": batch.id, "status": "CONFIRMED", "job": None})
     assert found["expired"][1]["error"] == "BATCH_EXPIRED" and found["locked"][1]["error"] == "BATCH_LOCKED"
     (portfolio,) = found["list"][1]
     assert (portfolio["name"], portfolio["capital"], portfolio["first_day"]) == ("hold", 50_000.0, "2021-01-01")
