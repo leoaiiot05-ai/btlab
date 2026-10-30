@@ -215,3 +215,14 @@ Covers SPEC.md §6.1, §6.6, §7 and §18, the lock and time lines of §23, and 
 
 - Retention for `events` and `job_runs` (Operations). Both tables keep every row, a few thousand a year. Seam: `append_event` and `start_job_run` in `store.py`.
 - Schema upgrades (Operations). The store creates schema version 1 and refuses a newer file; a later schema needs an upgrade step. Seam: where `_Database` reads `user_version`.
+
+## Result
+
+- **AC-2 holds.** `.venv/bin/python -m pytest -q` (cloud session, Linux, Python 3.13, SQLite 3.45): 200 passed, 70 of them in `tests/test_store.py`. The suite also passes with `-X dev -W error`, so no connection is left open.
+- **Built as planned**, with these small differences:
+  - Two actions of one kind on one day, and two suspensions with one start day, raise `ValueError` before anything is written, like a repeated list symbol, instead of reaching SQLite's primary key. Either way nothing changes; the replacement counts compare the stored and the new records by key.
+  - `save_minute_day` also refuses OK or MISMATCH without bars, so coverage OK never exists without its bars.
+  - `test_opening_fails_when_no_journal_mode_can_be_set` is its own test, and `test_every_table_of_btlab_db_has_a_round_trip` checks that the access round trips and the raw round trips together cover every table of `btlab.db`.
+- **For later prompts:**
+  - The connection keeps sqlite3's default `check_same_thread=True`. A prompt that moves store calls to a thread (for example, loading minute bars with `asyncio.to_thread`) changes `_Database` only (§26).
+  - `MinuteStore.save_minute_day` inserts or replaces by `t` and never deletes a day's other bars; the backfill queue (prompt 21) never refetches an OK day.
