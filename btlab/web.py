@@ -28,7 +28,7 @@ from btlab.builtins import BUILTINS
 from btlab.calendar import session
 from btlab.config import Config
 from btlab.intraday import TIMEFRAME_MINUTES, resample
-from btlab.jobs import JobRunning
+from btlab.jobs import PERMISSION_KEY, JobRunning
 from btlab.markets import MARKETS, category_by_rule, normalize_symbol
 from btlab.metrics import drawdown
 from btlab.notifier import Notifier, Silent
@@ -119,6 +119,7 @@ def make_app(services: Services) -> web.Application:
         web.patch("/api/symbols/{market}/{symbol}", patch_symbol),
         web.delete("/api/symbols/{market}/{symbol}", delete_symbol),
         web.post("/api/update", update),
+        web.post("/api/minute/backfill", backfill),
         web.get("/api/spylead", get_spylead),
         web.post("/api/spylead/snapshot", snapshot),
         web.post("/api/jobs/{lane}/cancel", cancel),
@@ -337,8 +338,8 @@ async def logout(request: web.Request) -> web.Response:
 
 
 async def state(request: web.Request) -> web.Response:
-    """The state document (§19): the app with its services, the markets, the jobs and the latest events. IB, ibguard
-    and live arrive with their features."""
+    """The state document (§19): the app with its services, the markets, the jobs and the latest events. ibguard and
+    live arrive with their features."""
     services = _services(request)
     now = _now(services)
     running = services.jobs.running()
@@ -363,11 +364,20 @@ def _app_state(services: Services, now: datetime) -> dict:
         "server_time": _utc(now),
         "mode": config.mode,
         "keys": {"tiingo": bool(config.tiingo.api_key), "finmind": bool(config.finmind.token), "fred": bool(config.fred.api_key)},
-        "services": {"spylead": _spylead(services, len)},
+        "services": {"ib": _ib(services), "spylead": _spylead(services, len)},
         "limits": None if config.mode == "test" or config.limits is None else asdict(config.limits),
         "schedule": {"enabled": schedule.enabled,
                      "next": {m: _utc(next_time(m, at, now)) for m, at in times.items()} if schedule.enabled else None},
     }
+
+
+def _ib(services: Services) -> dict:
+    """Whether IB is configured and connected, the account kind, and per market whether IB last served its minute bars
+    or refused them for lack of permission (§5.4)."""
+    link = services.jobs.ib
+    return {"configured": bool(services.config.ib.host), "connected": link is not None and link.connected,
+            "account_kind": None if link is None else link.account_kind,
+            "permissions": {market: services.store.setting(PERMISSION_KEY.format(market=market)) for market in MARKETS}}
 
 
 def _spylead(services: Services, series: Callable[[tuple[ExternalSeries, ...]], Any]) -> dict:
@@ -517,6 +527,18 @@ async def update(request: web.Request) -> web.Response:
     """202 with the job's lane and kind; 409 JOB_RUNNING while the DATA lane is busy."""
     market = _market(_object(await read_json(request), ("market",)).get("market"), "market")
     job = _services(request).jobs.update(market)
+    return _json({"lane": job.lane, "kind": job.kind}, 202)
+
+
+async def backfill(request: web.Request) -> web.Response:
+    """202 with the job's lane and kind; 409 IB_NOT_CONFIGURED without IB's host, or JOB_RUNNING while the MINUTE
+    lane is busy."""
+    body = _object(await read_json(request), ("market",))
+    market = _market(body["market"], "market") if "market" in body else None
+    services = _services(request)
+    if not services.config.ib.host:
+        raise ApiError(409, "IB_NOT_CONFIGURED", "IB's host is empty in config.toml: minute bars are off")
+    job = services.jobs.backfill(market)
     return _json({"lane": job.lane, "kind": job.kind}, 202)
 
 

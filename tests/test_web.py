@@ -34,6 +34,8 @@ class StubJobs:
         self.busy: set[str] = set()
         self.updates: list[str] = []
         self.snapshots = 0
+        self.backfills: list[str | None] = []
+        self.ib = None
         self.cancelled: list[str] = []
         self.failure: Exception | None = None
 
@@ -53,6 +55,12 @@ class StubJobs:
             raise JobRunning("DATA")
         self.snapshots += 1
         return SimpleNamespace(lane="DATA", kind="SPYLEAD_SNAPSHOT")
+
+    def backfill(self, market: str | None = None) -> SimpleNamespace:
+        if "MINUTE" in self.busy:
+            raise JobRunning("MINUTE")
+        self.backfills.append(market)
+        return SimpleNamespace(lane="MINUTE", kind="MINUTE_BACKFILL")
 
     def cancel(self, lane: str) -> bool:
         self.cancelled.append(lane)
@@ -121,7 +129,7 @@ def api_routes(world) -> list[tuple[str, str]]:
 
 def test_every_api_route_but_login_needs_the_session(world):
     routes = api_routes(world)
-    assert len(routes) == 40
+    assert len(routes) == 41
 
     async def scenario(client):
         return [await answer(await client.request(method, path, json={})) for method, path in routes]
@@ -457,7 +465,10 @@ def test_the_state_document(world):
     assert status == 200 and set(found) == {"app", "markets", "jobs", "events"}
     assert found["app"] == {"server_time": "2026-10-28T01:00:00Z", "mode": "test",
                             "keys": {"tiingo": True, "finmind": True, "fred": True},
-                            "services": {"spylead": {"configured": True, "snapshot_at": None, "series": 0}},
+                            "services": {
+                                "ib": {"configured": True, "connected": False, "account_kind": None,
+                                       "permissions": {"US": None, "TW": None}},
+                                "spylead": {"configured": True, "snapshot_at": None, "series": 0}},
                             "limits": None, "schedule": {"enabled": False, "next": None}}
     assert found["markets"] == {
         "US": {"data_start": "1995-10-27", "last_day": "2020-12-31", "symbols": 1,
@@ -522,8 +533,8 @@ def test_spylead_routes_the_state_and_the_registry_show_the_stored_series(world)
     series = [(o["name"], o["in_sample"], o["timeframes"]) for o in found["registry"][1] if o["kind"] == "series"]
     assert series == [("F", True, ["1d", "1m", "5m", "15m", "30m", "60m"]), ("SPYL1", False, ["1d", "1m", "5m", "15m", "30m", "60m"])]
     assert found["valid"] == (200, {"ok": True, "errors": []})
-    assert found["state"][1]["app"]["services"] == {"spylead": {"configured": True, "snapshot_at": "2026-10-28T01:00:00Z",
-                                                                "series": 2}}
+    assert found["state"][1]["app"]["services"]["spylead"] == {"configured": True, "snapshot_at": "2026-10-28T01:00:00Z",
+                                                                "series": 2}
     assert found["busy"][0] == 409 and found["busy"][1]["error"] == "JOB_RUNNING"
 
 

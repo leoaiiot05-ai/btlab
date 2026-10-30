@@ -1,4 +1,5 @@
-"""Corporate-action normalization, adjusted series and alignment to a calendar (SPEC.md §6). Pure.
+"""Corporate-action normalization, adjusted series and alignment to a calendar (SPEC.md §6), and IB's minute bars in
+raw prices (§5.4). Pure.
 
 Problems are returned as ActionIssue values; the caller records the events.
 """
@@ -17,6 +18,7 @@ from btlab.records import (
     DayEvents,
     DividendPolicy,
     DividendResult,
+    MinuteBars,
     ParValueChange,
     SplitPrice,
     to_date,
@@ -24,6 +26,8 @@ from btlab.records import (
 
 # A share ratio this close to 1 changes nothing (§6.2).
 RATIO_TOLERANCE = 1e-6
+# A day's minute bars match its daily close when the factor is this close to 1 or to the later share ratios (§5.4).
+MINUTE_TOLERANCE = 0.02
 # The factor of an event day, net of its share ratio, must lie in (0, MAX_NET_FACTOR] (§6.3).
 MAX_NET_FACTOR = 2.0
 # Order of the events of one day, for the detail of a merged action (§6.2).
@@ -262,6 +266,27 @@ def _carried_closes(bars: DailyBars) -> np.ndarray:
 
 def _traded(bars: DailyBars) -> np.ndarray:
     return np.isfinite(bars.close) & ~bars.no_trade
+
+
+# ----- IB's minute bars (§5.4) -----
+
+
+def share_ratio_after(actions: Sequence[Action], day: int) -> float:
+    """The product of the share ratios of the actions after day: how IB has split-adjusted that day's bars."""
+    return math.prod(action.ratio for action in actions if action.kind == "SHARE_RATIO" and action.day > day)
+
+
+def normalize_minutes(bars: MinuteBars, daily_close: float, ratio: float) -> tuple[MinuteBars, str, float]:
+    """A day's bars from IB in raw prices, with their coverage status and the factor daily close ÷ last minute close.
+    Within 2% of 1: as returned. Within 2% of ratio, the share ratios after the day: prices × ratio, volumes ÷ ratio.
+    Otherwise as returned, and MISMATCH."""
+    factor = float(daily_close / bars.close[-1])
+    if abs(factor - 1) <= MINUTE_TOLERANCE:
+        return bars, "OK", factor
+    if abs(factor / ratio - 1) <= MINUTE_TOLERANCE:
+        prices = (bars.open * ratio, bars.high * ratio, bars.low * ratio, bars.close * ratio)
+        return MinuteBars(bars.t, *prices, bars.volume / ratio), "OK", factor
+    return bars, "MISMATCH", factor
 
 
 # ----- alignment (§6.4, §6.5) -----

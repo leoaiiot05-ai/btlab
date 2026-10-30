@@ -10,6 +10,7 @@ import ctypes
 import logging
 import sys
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
@@ -25,19 +26,21 @@ from btlab.config import ScheduleConfig, ServiceConfig
 from btlab.finmind import FinMindClient
 from btlab.fred import FredClient
 from btlab.http import RequestBudget, Requester, SourceError, fetch_start, redact
+from btlab.ib_link import IbError, IbLink
 from btlab.markets import MARKETS, category_by_rule
 from btlab.notifier import Notifier, Silent
 from btlab.optimize import NeedsConfirmation, OptimizeError, PoolFactory, Request, optimize, parse_request
 from btlab.plugins import Plugin
-from btlab.prices import ActionIssue, normalize_tw_actions, normalize_us_actions
-from btlab.records import Action, DailyBars, ExternalSnapshot, to_date, to_day
+from btlab.prices import ActionIssue, normalize_minutes, normalize_tw_actions, normalize_us_actions, share_ratio_after
+from btlab.records import Action, Contract, DailyBars, ExternalSnapshot, MinuteBars, MinuteCoverage, to_date, to_day
 from btlab.scheduler import due_updates, exhausted
 from btlab.spylead_client import SOURCE as SPYLEAD, SpyleadClient
 from btlab.store import MinuteStore, Store
 from btlab.taxes import TaxTable
 from btlab.tiingo import TiingoClient
 
-LANES = {"UPDATE_US": "DATA", "UPDATE_TW": "DATA", "SPYLEAD_SNAPSHOT": "DATA", "BACKTEST": "COMPUTE", "OPTIMIZE": "COMPUTE"}
+LANES = {"UPDATE_US": "DATA", "UPDATE_TW": "DATA", "SPYLEAD_SNAPSHOT": "DATA", "MINUTE_BACKFILL": "MINUTE",
+         "BACKTEST": "COMPUTE", "OPTIMIZE": "COMPUTE"}
 # data_start: 30 years plus one year of indicator warm-up (§4.1).
 DATA_YEARS = 31
 TIINGO_SYMBOL_WARNING = 450
@@ -53,7 +56,9 @@ _END_EVENTS = {
 }
 _SAVED_EVENTS = {"BACKTEST": "BACKTEST_SAVED", "OPTIMIZE": "OPTIMIZATION_SAVED"}
 # What a job's progress and record show; the UI localizes each.
-PHASES = ("CALENDAR", "INFO", "BARS", "ACTIONS", "RATES", "SNAPSHOT", "LOAD", "CHECK", "SIMULATE", "SAVE")
+PHASES = ("CALENDAR", "INFO", "BARS", "ACTIONS", "RATES", "SNAPSHOT", "CONNECT", "MINUTES", "LOAD", "CHECK", "SIMULATE",
+          "SAVE")
+PERMISSION_KEY = "ib_permission/{market}"
 OUTCOMES = (*_END_EVENTS, "DONE")
 
 log = logging.getLogger(__name__)
@@ -164,7 +169,8 @@ class Jobs:
     """The lanes (§17.1): starting, following, stopping and recording jobs. Start them from the event loop.
 
     plugins gives the loaded plugins; pool makes the process pool of §13.7 with workers workers; session makes the
-    aiohttp session of one job (§5.7); clock gives UTC epoch seconds. spylead with an empty url is not configured.
+    aiohttp session of one job (§5.7); clock gives UTC epoch seconds. spylead with an empty url is not configured, and
+    without ib there are no minute bars (§17.3).
     """
 
     def __init__(
@@ -173,9 +179,11 @@ class Jobs:
         notifier: Notifier | None = None, session: Callable[[], Any] = aiohttp.ClientSession,
         clock: Callable[[], float] = time.time, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         keep_awake: KeepAwake | None = None, spylead: ServiceConfig = ServiceConfig("", ""),
+        ib: IbLink | None = None, backfill_years: int = 3,
     ) -> None:
         self.store, self.minute_store, self.keys, self.taxes = store, minute_store, keys, taxes
         self.plugins, self.pool, self.workers, self.spylead = plugins, pool, workers, spylead
+        self.ib, self.backfill_years = ib, backfill_years
         self.notifier = notifier or Silent()
         self.session, self.clock, self.sleep = session, clock, sleep
         self.keep_awake = keep_awake or KeepAwake()
@@ -192,6 +200,18 @@ class Jobs:
     def snapshot(self) -> Job:
         """SPYLEAD_SNAPSHOT (§5.6), on the DATA lane."""
         return self._start("SPYLEAD_SNAPSHOT", self._snapshot)
+
+    def backfill(self, market: str | None = None) -> Job:
+        """MINUTE_BACKFILL (§17.3) of one market's minute symbols, or of both markets'. Needs ib."""
+        markets = tuple(MARKETS) if market is None else (market,)
+        return self._start("MINUTE_BACKFILL", lambda job: _Backfill(self, job, markets).run())
+
+    def permission(self, market: str) -> str | None:
+        """OK or NO_PERMISSION as IB last answered for the market's minute bars, or None (§5.4)."""
+        return self.store.setting(PERMISSION_KEY.format(market=market))
+
+    def lane_job(self, lane: str) -> Job | None:
+        return self._jobs.get(lane)
 
     async def take_snapshot(self, job: Job, session: Any) -> int:
         """SNAPSHOT: spylead's series replace the stored set in one transaction, and their count is returned. When
@@ -281,9 +301,21 @@ class Jobs:
         self.store.finish_job_run(run_id, self.now(), outcome, message)
         level, kind = ("INFO", _SAVED_EVENTS[job.kind]) if outcome == "DONE" else _END_EVENTS[outcome]
         self.event(level, kind, f"{job.kind} {outcome}" + (f": {message}" if message else ""), market)
+        if market is not None and outcome in ("UPDATED", "PARTIAL"):
+            self._follow_up(market)
         if outcome == "FAILED" and job.scheduled_for is not None:
             if exhausted(self.store.latest_job_runs(job.kind, RUNS_SEEN), job.scheduled_for):
                 await self.notifier.send("UPDATE_FAILED", market=market, error=message)
+
+    def _follow_up(self, market: str) -> None:
+        """After a market's update (§17.2): IB may be asked again for its minute bars (§5.4), and a backfill fetches
+        the new sessions; a running one picks them up after its pause."""
+        if self.ib is None:
+            return
+        if self.permission(market) == "NO_PERMISSION":
+            self.store.save_setting(PERMISSION_KEY.format(market=market), None)
+        if "MINUTE" not in self._jobs:
+            self.backfill()
 
     async def _snapshot(self, job: Job) -> tuple[str, str]:
         async with self.session() as session:
@@ -533,6 +565,142 @@ class _Update:
 
     def _event(self, level: str, kind: str, message: str, symbol: str | None = None) -> None:
         self.jobs.event(level, kind, message, self.market, symbol)
+
+
+class _Backfill:
+    """MINUTE_BACKFILL (§17.3): every uncovered symbol-day of the minute symbols, newest first, from IB, in raw prices
+    (§5.4) and stored with its coverage. A market IB refuses gets no more requests until its next update; IB
+    unreachable ends the job."""
+
+    def __init__(self, jobs: Jobs, job: Job, markets: tuple[str, ...]) -> None:
+        self.jobs, self.job, self.markets = jobs, job, markets
+        self.store, self.minute_store = jobs.store, jobs.minute_store
+        self.closes: dict[tuple[str, str], dict[int, float]] = {}
+        self.exchanges: dict[tuple[str, str], str | None] = {}
+        self.unresolved: set[tuple[str, str]] = set()
+        self.counts: Counter = Counter()
+
+    async def run(self) -> tuple[str, str]:
+        self.job.begin("CONNECT")
+        try:
+            await self.job.race(self.jobs.ib.connect())
+            await self._days()
+        except IbError as error:
+            return "FAILED", f"IB_UNREACHABLE: {error}"
+        summary = ", ".join(f"{status} {count}" for status, count in sorted(self.counts.items()))
+        return ("UPDATED", summary) if summary else ("UP_TO_DATE", "nothing to fetch")
+
+    async def _days(self) -> None:
+        queue = self._queue()
+        self.job.begin("MINUTES", len(queue))
+        started = self.jobs.clock()
+        while queue:
+            if await self._paused():
+                # The update may have stored new sessions (§5.5).
+                queue = self._queue()
+                self.job.total = self.job.done + len(queue)
+                continue
+            await self._day(*queue.pop(0))
+            self.job.done += 1
+            self._estimate(started)
+
+    async def _paused(self) -> bool:
+        """The MINUTE lane waits while a DATA job runs (§17.1); True when it waited."""
+        waited = False
+        while (data := self.jobs.lane_job("DATA")) is not None:
+            self.job.message, waited = "paused while a data job runs", True
+            await self.job.race(asyncio.shield(data.task))
+        return waited
+
+    def _queue(self) -> list[tuple[int, str, str]]:
+        """(day, market, symbol) of every uncovered day, newest first; a market IB refused is left out."""
+        queue = []
+        for market in self.markets:
+            if self.jobs.permission(market) == "NO_PERMISSION":
+                continue
+            for info in self.store.symbols(market):
+                key = (market, info.symbol)
+                if info.minute_enabled and key not in self.unresolved:
+                    self.exchanges[key] = info.exchange
+                    queue += [(day, market, info.symbol) for day in self._uncovered(market, info.symbol)]
+        return sorted(queue, key=lambda item: (-item[0], item[1], item[2]))
+
+    def _uncovered(self, market: str, symbol: str) -> list[int]:
+        """The days with a traded daily bar, from backfill_years before the latest one, whose coverage is missing or
+        FAILED (§17.3)."""
+        bars = self.store.daily_bars(market, symbol)
+        if not len(bars.day):
+            return []
+        first = to_day(_years_before(to_date(int(bars.day[-1])), self.jobs.backfill_years))
+        traded = (bars.day >= first) & ~bars.no_trade
+        self.closes[(market, symbol)] = dict(zip(bars.day[traded].tolist(), bars.close[traded].tolist()))
+        covered = {c.day for c in self.minute_store.minute_coverage(market, symbol, first) if c.status != "FAILED"}
+        return [day for day in self.closes[(market, symbol)] if day not in covered]
+
+    async def _day(self, day: int, market: str, symbol: str) -> None:
+        self.job.check()
+        self.job.item = f"{symbol} {to_date(day).isoformat()}"
+        if self.jobs.permission(market) == "NO_PERMISSION" or (market, symbol) in self.unresolved:
+            return
+        try:
+            contract = await self._contract(market, symbol)
+            bars = await self.job.race(self.jobs.ib.minute_bars(market, symbol, contract, day))
+        except IbError as error:
+            if error.kind == "UNREACHABLE":
+                raise
+            self._refused(day, market, symbol, error)
+        else:
+            self._stored(day, market, symbol, bars)
+
+    async def _contract(self, market: str, symbol: str) -> Contract:
+        """From the store, else resolved and cached (§5.4). A symbol IB cannot resolve waits for the next run."""
+        found = self.store.contract(market, symbol)
+        if found is None:
+            try:
+                found = await self.job.race(self.jobs.ib.contract(market, symbol, self.exchanges[(market, symbol)]))
+            except IbError as error:
+                if error.kind == "FAILED":
+                    self.unresolved.add((market, symbol))
+                raise
+            self.store.save_contract(market, symbol, found)
+        return found
+
+    def _refused(self, day: int, market: str, symbol: str, error: IbError) -> None:
+        """IB's "no data" is EMPTY; NO_PERMISSION stops the market until its next update; anything else is FAILED and
+        retried by a later run."""
+        status = {"NO_DATA": "EMPTY", "NO_PERMISSION": "NO_PERMISSION"}.get(error.kind, "FAILED")
+        self._save(market, symbol, MinuteCoverage(day, status, None, self.jobs.now()))
+        if status == "FAILED":
+            log.warning("minute bars %s %s: %s", market, symbol, error)
+        if status == "NO_PERMISSION":
+            self._permission(market, "NO_PERMISSION")
+            self.jobs.event("WARNING", "MINUTE_NO_PERMISSION",
+                            f"{error}; no {market} minute requests until the next {market} update", market, symbol)
+
+    def _stored(self, day: int, market: str, symbol: str, bars: MinuteBars) -> None:
+        ratio = share_ratio_after(self.store.actions(market, symbol), day)
+        found, status, factor = normalize_minutes(bars, self.closes[(market, symbol)][day], ratio)
+        self._save(market, symbol, MinuteCoverage(day, status, factor, self.jobs.now()), found)
+        self._permission(market, "OK")
+        if status == "MISMATCH":
+            self.jobs.event("WARNING", "MINUTE_MISMATCH", f"{to_date(day).isoformat()}: the daily close is {factor:.4f} × "
+                            "the last minute close; that day's exits use the daily path", market, symbol)
+
+    def _save(self, market: str, symbol: str, coverage: MinuteCoverage, bars: MinuteBars | None = None) -> None:
+        self.minute_store.save_minute_day(market, symbol, coverage, bars)
+        self.counts[coverage.status] += 1
+
+    def _permission(self, market: str, value: str) -> None:
+        if self.jobs.permission(market) != value:
+            self.store.save_setting(PERMISSION_KEY.format(market=market), value)
+
+    def _estimate(self, started: float) -> None:
+        """The end at the pace so far (§17.3)."""
+        left = self.job.total - self.job.done
+        if left > 0:
+            now = self.jobs.clock()
+            end = datetime.fromtimestamp(now + (now - started) / self.job.done * left, TAIPEI)
+            self.job.message = f"ends about {end:%H:%M}"
 
 
 def _years_before(day: date, years: int) -> date:

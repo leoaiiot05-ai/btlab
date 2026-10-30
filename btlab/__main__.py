@@ -14,6 +14,7 @@ from aiohttp import web
 
 from btlab.config import Config, ConfigError, ScheduleConfig, load_config, startup_warnings
 from btlab.http import redact
+from btlab.ib_link import IbLink
 from btlab.jobs import Jobs, Keys
 from btlab.notifier import make_notifier
 from btlab.optimize import PoolFactory, default_workers, process_pool
@@ -94,9 +95,12 @@ async def run(config: Config, taxes: TaxTable, stop: asyncio.Event | None = None
         plugins = PluginFolder(config.root / "strategies")
         log.info("plugins loaded: %d, %d failed", len(plugins.plugins), len(plugins.errors))
         workers = default_workers()
+        # IB connects on demand, when a job first needs it (§22).
+        ib = IbLink(config.ib, config.mode) if config.ib.host else None
         jobs = Jobs(store, minute_store, Keys(config.tiingo.api_key, config.finmind.token, config.fred.api_key), taxes,
                     lambda: plugins.plugins, pool or process_pool(workers), workers,
-                    notifier=make_notifier(config.email, config.mode), spylead=config.spylead)
+                    notifier=make_notifier(config.email, config.mode), spylead=config.spylead, ib=ib,
+                    backfill_years=config.minute.backfill_years)
         app = make_app(Services(config, store, minute_store, jobs, plugins, time.time, notifier=jobs.notifier))
         runner = await (serve or (lambda found: start_site(found, config.web.port)))(app)
         log.info("web server listening on 127.0.0.1")
@@ -110,6 +114,8 @@ async def run(config: Config, taxes: TaxTable, stop: asyncio.Event | None = None
             log.info("web server stopped")
             await jobs.interrupt()
             log.info("jobs stopped")
+            if ib is not None:
+                ib.close()
     finally:
         store.close()
         minute_store.close()
