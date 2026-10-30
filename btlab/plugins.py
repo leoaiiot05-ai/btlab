@@ -57,6 +57,17 @@ class Plugin:
     module: ModuleType
 
 
+class PluginFolder:
+    """The plugins of strategies/, loaded at startup and on reload (§9.5). Jobs and routes read the current ones."""
+
+    def __init__(self, folder: Path) -> None:
+        self.folder = Path(folder)
+        self.reload()
+
+    def reload(self) -> None:
+        self.plugins, self.errors = load_plugins(self.folder)
+
+
 def load_plugins(folder: Path) -> tuple[dict[str, Plugin], list[LoadError]]:
     """Every *.py file of the folder whose name does not start with "_", in name order; a broken one does not stop
     the others."""

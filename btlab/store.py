@@ -469,6 +469,11 @@ class Store(_Database):
         day, open_, high, low, close, volume, no_trade = _float_columns(rows, 7)
         return DailyBars(day.astype(np.int64), open_, high, low, close, volume, no_trade.astype(bool))
 
+    def market_last_day(self, market: str) -> int | None:
+        """The latest stored bar of any of the market's symbols."""
+        ((last,),) = self._read("SELECT MAX(day) FROM daily_bars WHERE market = ?", (market,))
+        return last
+
     def daily_bar_range(self, market: str, symbol: str) -> tuple[int, int] | None:
         """The first and last stored day, or None without bars."""
         ((first, last),) = self._read(

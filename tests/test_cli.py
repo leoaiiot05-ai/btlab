@@ -1,15 +1,22 @@
 """python -m btlab --config <path> (SPEC.md §22) and logging (SPEC.md §23)."""
 
+import asyncio
 import logging
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import pytest
 
-from btlab.__main__ import main, setup_logging
+from btlab.__main__ import LOCKED, main, run, setup_logging, take_lock
+from btlab.config import load_config
+from btlab.taxes import load_taxes
+from btlab.web import start_site
+from fakes import InlinePool
 
 REPO = Path(__file__).resolve().parents[1]
 TOKEN = "Sentinel-Web-Token-0123456789"
@@ -78,14 +85,63 @@ def test_the_example_config_fails_on_the_placeholder_token_without_network(tmp_p
     assert "web.token is still the placeholder" in done.stderr
 
 
-def test_main_loads_the_config_and_the_tax_table_then_exits(tmp_path, logging_sandbox):
+@contextmanager
+def held_lock(path: Path) -> Iterator[None]:
+    """Another process takes the lock and keeps it until it is killed, when the block ends."""
+    with subprocess.Popen([sys.executable, "-c", HOLD, str(path)], cwd=REPO, stdout=subprocess.PIPE, text=True) as holder:
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            yield
+        finally:
+            holder.kill()
+
+
+HOLD = """
+import sys, time
+from pathlib import Path
+from btlab.__main__ import take_lock
+lock = take_lock(Path(sys.argv[1]))
+print("held" if lock else "busy", flush=True)
+time.sleep(120)
+"""
+
+
+def test_main_exits_before_any_database_while_another_process_holds_the_lock(tmp_path, logging_sandbox):
     call, _ = logging_sandbox
     root = config_dir(tmp_path)
-    assert call(main, ["--config", str(root / "config.toml")]) == 1
+    with held_lock(root / "data" / "btlab.lock"):
+        assert call(main, ["--config", str(root / "config.toml")]) == LOCKED
+    assert sorted(path.name for path in (root / "data").iterdir()) == ["btlab.lock"]
     text = (root / "logs" / "btlab.log").read_text(encoding="utf-8")
     assert "tiingo.api_key is empty; its requests will fail with MISSING_KEY" in text
-    assert "the app is not implemented yet" in text
-    assert TOKEN not in text
+    assert "another btlab process is running" in text and TOKEN not in text
+
+
+def test_a_lock_left_by_a_killed_process_does_not_block_a_restart(tmp_path):
+    path = tmp_path / "data" / "btlab.lock"
+    with held_lock(path):
+        assert take_lock(path) is None
+    lock = take_lock(path)  # the holder was killed
+    assert lock is not None
+    lock.close()
+
+
+def test_startup_and_shutdown_follow_section_23(tmp_path, caplog):
+    root = config_dir(tmp_path)
+    config, taxes = load_config(root / "config.toml"), load_taxes(root / "taxes.toml")
+    caplog.set_level(logging.INFO, logger="btlab")
+
+    async def go():
+        stop = asyncio.Event()
+        stop.set()
+        await run(config, taxes, stop, pool=InlinePool, serve=lambda app: start_site(app, 0))
+
+    asyncio.run(go())
+    assert [record.getMessage() for record in caplog.records if record.name == "btlab"] == [
+        "stores open", "plugins loaded: 0, 0 failed", "web server listening on 127.0.0.1", "scheduler started; ready",
+        "web server stopped", "jobs stopped", "stores closed",
+    ]
+    assert (root / "data" / "btlab.db").exists() and (root / "data" / "minute.db").exists()
 
 
 def test_main_rejects_a_missing_tax_table_before_logging(tmp_path, capsys):

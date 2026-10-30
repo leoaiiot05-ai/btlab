@@ -35,6 +35,13 @@ def due_time(market: str, at: time, now: datetime) -> datetime:
     return next(m for m in moments if m.weekday() in WEEKDAYS[market] and m <= local).astimezone(timezone.utc)
 
 
+def next_time(market: str, at: time, now: datetime) -> datetime:
+    """The market's first scheduled moment after now, in UTC: the state document's next update."""
+    local = now.astimezone(TAIPEI)
+    moments = (datetime.combine(local.date() + timedelta(days=ahead), at, TAIPEI) for ahead in range(8))
+    return next(m for m in moments if m.weekday() in WEEKDAYS[market] and m > local).astimezone(timezone.utc)
+
+
 def due_updates(now: datetime, times: Mapping[str, time], runs: Mapping[str, Sequence[JobRun]]) -> list[Due]:
     """The updates due now, earliest due time first. times holds each market's update time in Asia/Taipei, runs each
     market's update runs, newest first."""

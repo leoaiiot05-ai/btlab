@@ -51,3 +51,10 @@ Covers SPEC.md §19 (the routes of this prompt), §21, §22 and §23. Acceptance
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-19 holds, the routes of this prompt meet AC-20, and AC-28's runtime part holds.** `.venv/bin/python -m pytest -q`: 1077 passed (also with `-X dev -W error`). The app was not started; the startup and shutdown order is tested through `run()` on an ephemeral 127.0.0.1 port.
+- Built as planned. `JobRunning` from any route becomes 409 JOB_RUNNING in the error middleware, so prompt 16's routes get it for free.
+- The CLI test that expected the placeholder exit now checks that a second process exits with code 3 before creating a database.
+- **For prompt 16:** add routes to the table in `make_app`; read bodies with `read_json`, check fields with `_object`/`_text`, raise `ApiError`; `Services.jobs` is the `Jobs` of prompt 14. Rounding to 6 significant digits belongs to the series, candle and metric payloads only.

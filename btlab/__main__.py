@@ -1,27 +1,43 @@
 """python -m btlab --config <path>: CLI, wiring and lifecycle (SPEC.md §22, §23)."""
 
 import argparse
+import asyncio
 import logging
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import IO
 
-from btlab.config import ConfigError, load_config, startup_warnings
+from aiohttp import web
+
+from btlab.config import Config, ConfigError, ScheduleConfig, load_config, startup_warnings
 from btlab.http import redact
-from btlab.taxes import TaxTableError, load_taxes
+from btlab.jobs import Jobs, Keys
+from btlab.notifier import make_notifier
+from btlab.optimize import PoolFactory, default_workers, process_pool
+from btlab.plugins import PluginFolder
+from btlab.store import MinuteStore, Store
+from btlab.taxes import TaxTable, TaxTableError, load_taxes
+from btlab.web import Services, make_app, start_site
 
 LOG_FILE_BYTES = 5 * 1024 * 1024
 LOG_FILE_BACKUPS = 5
+LOCK_FILE = "btlab.lock"
+TICK_S = 60.0
+# A second process exits with this code, before opening a database or the port.
+LOCKED = 3
 
 log = logging.getLogger("btlab")
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Startup in the order of §23: config, tax table, the process lock, then the app until Ctrl+C."""
     args = _parse_args(argv)
     try:
         config = load_config(args.config)
-        load_taxes(config.root / "taxes.toml")
+        taxes = load_taxes(config.root / "taxes.toml")
     except (ConfigError, TaxTableError) as error:
         # Logging is not set up yet: logs/ sits next to a config file that may not be usable.
         print(f"btlab: {error}", file=sys.stderr)
@@ -30,8 +46,84 @@ def main(argv: list[str] | None = None) -> int:
     for warning in startup_warnings(config):
         log.warning(warning)
     log.info("config and tax table loaded; mode %s", config.mode)
-    log.warning("the app is not implemented yet; exiting")
-    return 1
+    lock = take_lock(config.root / "data" / LOCK_FILE)
+    if lock is None:
+        log.error("another btlab process is running on %s; exiting", config.root / "data")
+        return LOCKED
+    try:
+        asyncio.run(run(config, taxes))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        lock.close()
+    return 0
+
+
+def take_lock(path: Path) -> IO[bytes] | None:
+    """An operating-system lock on path, held while the returned file stays open (§23): msvcrt on Windows, flock
+    elsewhere. None when another process holds it. It dies with its process; the file's presence means nothing."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+async def run(config: Config, taxes: TaxTable, stop: asyncio.Event | None = None, *, pool: PoolFactory | None = None,
+              serve: Callable[[web.Application], Awaitable[web.AppRunner]] | None = None) -> None:
+    """Both stores, the plugins, the jobs with the real pool, the web server and the scheduler, then serving until
+    stop is set or Ctrl+C. Shutdown stops accepting requests, interrupts the jobs (their pools close with them) and
+    closes the stores (§23)."""
+    stop = stop or asyncio.Event()
+    data = config.root / "data"
+    store = Store(data)
+    minute_store = MinuteStore(data)
+    log.info("stores open")
+    try:
+        plugins = PluginFolder(config.root / "strategies")
+        log.info("plugins loaded: %d, %d failed", len(plugins.plugins), len(plugins.errors))
+        workers = default_workers()
+        jobs = Jobs(store, minute_store, Keys(config.tiingo.api_key, config.finmind.token, config.fred.api_key), taxes,
+                    lambda: plugins.plugins, pool or process_pool(workers), workers,
+                    notifier=make_notifier(config.email, config.mode))
+        app = make_app(Services(config, store, minute_store, jobs, plugins, time.time, notifier=jobs.notifier))
+        runner = await (serve or (lambda found: start_site(found, config.web.port)))(app)
+        log.info("web server listening on 127.0.0.1")
+        scheduler = asyncio.create_task(_schedule(jobs, config.schedule))
+        log.info("scheduler started; ready")
+        try:
+            await stop.wait()
+        finally:
+            scheduler.cancel()
+            await runner.cleanup()
+            log.info("web server stopped")
+            await jobs.interrupt()
+            log.info("jobs stopped")
+    finally:
+        store.close()
+        minute_store.close()
+        log.info("stores closed")
+
+
+async def _schedule(jobs: Jobs, schedule: ScheduleConfig) -> None:
+    """A tick at once, for the catch-up, then every minute (§17.4). A failing tick is logged and the next one runs."""
+    while True:
+        try:
+            jobs.tick(schedule)
+        except Exception:
+            log.exception("the scheduler's tick failed")
+        await asyncio.sleep(TICK_S)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
