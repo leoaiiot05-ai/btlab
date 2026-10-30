@@ -43,6 +43,8 @@ Nothing here is in scope for v1. Do not build any of it without being asked. App
 - [ ] Retention for the `events` and `job_runs` tables; today both keep every row (a few thousand a year). Seam: `append_event` and `start_job_run` in `store.py`.
 - [ ] Schema upgrades for the databases; today the store creates schema version 1 and refuses a file with a newer `user_version`. Seam: where `store._Database` reads `user_version`.
 - [ ] `Retry-After` as an HTTP date; today it counts as the 60 s default. Seam: `_retry_after` in `http.py`.
+- [ ] A graceful stop for the autostarted btlab (a tray icon or a button in Settings); today Ctrl+C works only in `run.bat`'s console, and the autostarted `pythonw.exe` is ended from Task Manager, which skips the orderly shutdown of §23 (safe, but a running job's row keeps no end). Seam: the `stop` event that `__main__.run` already takes.
+- [ ] Wake the PC from sleep for a scheduled update (a wake timer); today a sleeping PC runs the missed update when it wakes. Seam: the autostart script's task settings, or a second scheduled task.
 
 ## Tests
 
