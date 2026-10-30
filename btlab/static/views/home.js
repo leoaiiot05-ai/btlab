@@ -12,6 +12,8 @@ export function render(root, context) {
   root.append(
     h("h2", {text: t("view.home")}),
     h("section", {class: "cards"}, Object.entries(state.markets).map(([market, info]) => marketCard(market, info, state))),
+    h("h3", {text: t("home.services")}),
+    h("section", {class: "cards"}, spyleadCard(state.app.services.spylead)),
     h("h3", {text: t("home.jobs")}),
     h("section", {id: "jobs", class: "cards"}, jobCards(context)),
     h("h3", {text: t("home.events")}),
@@ -38,6 +40,14 @@ function marketCard(market, info, state) {
     row(t("home.last_update"), last ? `${code("outcome", last.outcome)} · ${moment(last.finished_at)}` : "—"),
     last && last.message ? h("p", {class: "detail", text: last.message}) : null,
     row(t("home.next_update"), next ? moment(next) : t("home.schedule_off")));
+}
+
+function spyleadCard(spylead) {
+  if (!spylead.configured) return h("article", {class: "card quiet"}, h("h4", {text: "spylead"}), h("p", {text: t("home.not_configured")}));
+  return h("article", {class: "card"},
+    h("h4", {text: "spylead"}),
+    row(t("home.snapshot"), moment(spylead.snapshot_at)),
+    row(t("home.series"), number(spylead.series, 0)));
 }
 
 function jobCards(context) {

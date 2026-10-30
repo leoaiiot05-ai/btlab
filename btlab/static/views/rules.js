@@ -213,7 +213,9 @@ function operandView(operand, path, state, redraw, replace) {
     return h("div", {class: "operand inline", data: {path}}, parts);
   }
   const found = available.find((item) => item.name === operand[kind]) || available[0];
-  parts.push(field(t("rules.operand_name"), select(available.map((item) => [item.name, item.name]), operand[kind], (value) => {
+  // F and COMPOSITE are fitted over their whole history (§5.6): the picker says so.
+  const label = (item) => (item.in_sample ? t("rules.in_sample", {name: item.name}) : item.name);
+  parts.push(field(t("rules.operand_name"), select(available.map((item) => [item.name, label(item)]), operand[kind], (value) => {
     replace({[kind]: value, ...(kind === "ind" || kind === "feature" ? {args: {}} : {})});
     redraw();
   }), `${path}.${kind}`));

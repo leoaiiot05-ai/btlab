@@ -120,10 +120,20 @@ def test_a_request_carries_its_parameters_headers_and_timeout():
     session = FakeSession(Answer(200, {"ok": [1, 2]}))
     assert get(requester(session)) == {"ok": [1, 2]}
     (call,) = session.calls
-    assert call.url == URL
+    assert (call.method, call.url, call.json) == ("GET", URL, None)
     assert call.params == {"series_id": "X", "api_key": SECRET}
     assert call.headers == {"Authorization": f"Token {SECRET}"}
     assert isinstance(call.timeout, aiohttp.ClientTimeout) and call.timeout.total == 30
+
+
+def test_a_post_sends_json_and_its_reply_holds_the_cookies_it_set():
+    session = FakeSession(Answer(204, b"", {"Set-Cookie": "session=abc123; HttpOnly; Path=/"}), Answer(201, {"id": 4}))
+    ask = requester(session)
+    first = asyncio.run(ask.send("POST", "login", URL, body={"token": SECRET}))
+    second = asyncio.run(ask.send("POST", "create", URL, body={}))
+    assert (first.body, first.cookies) == (None, {"session": "abc123"})
+    assert (second.body, second.cookies) == ({"id": 4}, {})
+    assert [(call.method, call.json) for call in session.calls] == [("POST", {"token": SECRET}), ("POST", {})]
 
 
 @pytest.mark.parametrize(

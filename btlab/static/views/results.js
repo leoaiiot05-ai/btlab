@@ -116,6 +116,7 @@ function flags(found, detail) {
     let extra = "";
     if (name === "LOOKAHEAD_SUSPECT" && value) extra = t("results.lookahead_at", {time: when(value.time, detail), symbol: value.symbol || "—"});
     if ((name === "PATH_FALLBACK" || name === "PDT") && value !== null) extra = t(`results.count_${name.toLowerCase()}`, {count: value});
+    if (name === "IN_SAMPLE_SERIES" && value) extra = t("results.in_sample_names", {names: value.join(", ")});
     parts.push(h("div", {class: "flag-banner", role: "alert"}, h("strong", {text: `! ${code("flag", name)}`}), extra ? ` — ${extra}` : ""));
   }
   return h("section", {class: "flags"}, parts);

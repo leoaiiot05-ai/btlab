@@ -1,5 +1,5 @@
-"""Fakes shared by the tests (SPEC.md §24.1): an HTTP session, an injected clock with its sleep, and a synchronous
-stand-in for the process pool."""
+"""Fakes shared by the tests (SPEC.md §24.1): an HTTP session, spylead's API, an injected clock with its sleep, and a
+synchronous stand-in for the process pool."""
 
 import json
 from collections.abc import Callable
@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 from typing import Any
+
+from aiohttp import web
 
 
 @dataclass
@@ -77,6 +79,60 @@ class FakeSession:
 
     async def __aexit__(self, *exc_info: Any) -> None:
         return None
+
+
+class FakeSpylead:
+    """spylead's documented JSON API, for an aiohttp test server on 127.0.0.1 (§24.1). The login takes the token and
+    sets a session cookie, which every other route needs. Each request is recorded as (method, path, whether the
+    cookie came). statuses are the series of the state; charts holds each chart's answer by path; failing paths
+    answer 500."""
+
+    COOKIE = ("spylead_session", "c0ffee")
+
+    def __init__(self, token: str, statuses: dict[str, str] | None = None, f_status: str = "OK") -> None:
+        self.token, self.f_status = token, f_status
+        self.statuses = {"HYG": "KEPT", "XLF": "DROPPED", "TLT": "KEPT"} if statuses is None else statuses
+        self.charts: dict[str, Any] = {
+            "/api/charts/spy": {"rt": {"first_day": "2026-01-01", "values": [1.0, None, 3.0]}},
+            "/api/charts/f": {"f": {"first_day": 20454, "values": [0.5, 0.25]},
+                              "composite": {"first_day": 20454, "values": [None, 1.5]}},
+            **{f"/api/charts/series/{name}": {"rt": {"first_day": "2026-01-02", "values": [2.0, -1.0]}} for name in self.statuses},
+        }
+        self.failing: set[str] = set()
+        self.requests: list[tuple[str, str, bool]] = []
+
+    def app(self) -> web.Application:
+        @web.middleware
+        async def guard(request: web.Request, handler: Callable) -> web.StreamResponse:
+            signed_in = request.cookies.get(self.COOKIE[0]) == self.COOKIE[1]
+            self.requests.append((request.method, request.path, signed_in))
+            if request.path in self.failing:
+                return web.json_response({"error": "INTERNAL"}, status=500)
+            if request.path != "/api/login" and not signed_in:
+                return web.json_response({"error": "UNAUTHORIZED"}, status=401)
+            return await handler(request)
+
+        app = web.Application(middlewares=[guard])
+        app.router.add_post("/api/login", self._login)
+        app.router.add_get("/api/state", self._state)
+        app.router.add_get("/api/charts/{chart:.+}", self._chart)
+        return app
+
+    async def _login(self, request: web.Request) -> web.Response:
+        if (await request.json()).get("token") != self.token:
+            return web.json_response({"error": "LOGIN_FAILED"}, status=401)
+        response = web.Response(status=204)
+        response.set_cookie(*self.COOKIE, httponly=True)
+        return response
+
+    async def _state(self, request: web.Request) -> web.Response:
+        return web.json_response({"series": [{"name": name, "status": status} for name, status in self.statuses.items()],
+                                  "f": {"status": self.f_status}})
+
+    async def _chart(self, request: web.Request) -> web.Response:
+        if request.path not in self.charts:
+            return web.json_response({"error": "NOT_FOUND"}, status=404)
+        return web.json_response(self.charts[request.path])
 
 
 class FakeTime:

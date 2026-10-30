@@ -337,8 +337,8 @@ async def logout(request: web.Request) -> web.Response:
 
 
 async def state(request: web.Request) -> web.Response:
-    """The state document (§19): the app, the markets, the jobs and the latest events. services and live arrive with
-    their features."""
+    """The state document (§19): the app with its services, the markets, the jobs and the latest events. IB, ibguard
+    and live arrive with their features."""
     services = _services(request)
     now = _now(services)
     running = services.jobs.running()

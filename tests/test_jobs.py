@@ -13,7 +13,7 @@ import pytest
 from numpy.testing import assert_array_equal
 
 from btlab.backtest import RunConfigError, load_run, run_backtest, strategy_factory, validate_config
-from btlab.config import ScheduleConfig
+from btlab.config import ScheduleConfig, ServiceConfig
 from btlab.jobs import JobRunning, Jobs, KeepAwake, Keys
 from btlab.optimize import NeedsConfirmation
 from btlab.records import to_day
@@ -64,13 +64,13 @@ class Notes:
 
 class Harness:
     def __init__(self, store: Store, *answers: Answer, keys: Keys = KEYS, start: datetime = NOW, step: float = 0.0,
-                 pool=InlinePool, session=None) -> None:
+                 pool=InlinePool, session=None, spylead: ServiceConfig = ServiceConfig("", "")) -> None:
         self.store, self.session, self.time = store, FakeSession(*answers), Clock(start, step)
         self.states: list[int] = []
         self.notes = Notes()
         self.jobs = Jobs(store, None, keys, TAXES, lambda: {}, pool, 1, notifier=self.notes,
                          session=session or (lambda: self.session), clock=self.time.clock, sleep=self.time.sleep,
-                         keep_awake=KeepAwake(self.states.append))
+                         keep_awake=KeepAwake(self.states.append), spylead=spylead)
 
     def run(self, start):
         """Starts a job and waits for its end."""

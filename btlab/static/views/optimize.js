@@ -207,7 +207,8 @@ async function detail(root, context, id) {
     h("p", {class: "detail", text: `${code("opt_mode", row.mode)} · ${code("outcome", row.status)} · ${
       code("objective", request.objective)} · ${t("optimize.min_trades")} ${request.min_trades} · ${moment(row.created_at)}`}),
     Object.keys(row.flags).filter((flag) => flag !== "SURVIVORSHIP").map((flag) =>
-      h("div", {class: "flag-banner", role: "alert", text: `! ${code("flag", flag)}`})),
+      h("div", {class: "flag-banner", role: "alert", text: `! ${code("flag", flag)}${flag === "IN_SAMPLE_SERIES" && row.flags[flag]
+        ? ` — ${t("results.in_sample_names", {names: row.flags[flag].join(", ")})}` : ""}`})),
     button(t("optimize.delete"), async () => {
       if (!confirm(t("optimize.confirm_delete", {name: row.name}))) return;
       try {

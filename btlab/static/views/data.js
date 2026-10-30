@@ -1,8 +1,8 @@
 // Data: lists, the symbols table and the market updates (SPEC.md §20.2 item 2, §7).
 
 import {get, patch, post, put, remove} from "../lib/api.js";
-import {button, checkbox, clear, field, h, select, showErrors} from "../lib/dom.js";
-import {code, day, errorText, number, t} from "../lib/i18n.js";
+import {append, button, checkbox, clear, field, h, select, showErrors} from "../lib/dom.js";
+import {code, day, errorText, moment, number, t} from "../lib/i18n.js";
 
 const MARKETS = ["US", "TW"];
 
@@ -10,13 +10,15 @@ export function render(root, context) {
   const message = h("p", {class: "message", role: "alert"});
   const lists = h("section", {class: "lists"});
   const symbols = h("section", {class: "symbols"});
+  const spylead = h("section", {class: "spylead"});
   let market = "US";
   const reload = async () => {
     try {
-      const [found, rows, strategies] = await Promise.all([
-        get("/api/lists"), get(`/api/symbols?market=${market}`), get("/api/strategies")]);
+      const [found, rows, strategies, snapshot] = await Promise.all([
+        get("/api/lists"), get(`/api/symbols?market=${market}`), get("/api/strategies"), get("/api/spylead")]);
       showLists(lists, found, reload, message);
       showSymbols(symbols, market, rows, strategies.defaults[market].categories, reload, message);
+      showSpylead(spylead, snapshot, context, message);
     } catch (error) {
       message.textContent = errorText(error);
     }
@@ -35,7 +37,9 @@ export function render(root, context) {
       market = value;
       reload();
     }),
-    symbols);
+    symbols,
+    h("h3", {text: t("data.spylead")}),
+    spylead);
   showJob(root, context);
   reload();
 }
@@ -69,6 +73,33 @@ async function startUpdate(market, context, message) {
   } catch (error) {
     message.textContent = errorText(error);
   }
+}
+
+function showSpylead(root, snapshot, context, message) {
+  // spylead's stored series, F and COMPOSITE marked in-sample, and [Snapshot now] (§5.6).
+  const start = button(t("data.snapshot"), async () => {
+    try {
+      await post("/api/spylead/snapshot");
+      message.textContent = t("data.snapshot_started");
+      context.refresh();
+    } catch (error) {
+      message.textContent = errorText(error);
+    }
+  });
+  start.disabled = !snapshot.configured;
+  let status = t("data.spylead_off");
+  if (snapshot.configured) status = snapshot.snapshot_at ? t("data.spylead_at", {time: moment(snapshot.snapshot_at)}) : t("data.spylead_never");
+  append(clear(root), [
+    h("div", {class: "actions"}, start, h("span", {class: "detail", text: status})),
+    snapshot.series.length ? h("div", {class: "table-scroll"}, h("table", {class: "table"},
+      h("thead", {}, h("tr", {}, [t("data.series_name"), t("data.series_first"), t("data.series_last"), t("data.series_in_sample")]
+        .map((label) => h("th", {text: label})))),
+      h("tbody", {}, snapshot.series.map((series) => h("tr", {},
+        h("td", {class: "symbol", text: series.name}),
+        h("td", {class: "nowrap", text: day(series.first_day)}),
+        h("td", {class: "nowrap", text: day(series.last_day)}),
+        h("td", {class: series.in_sample ? "warning" : "", text: series.in_sample ? t("data.in_sample") : "—"})))))) : null,
+  ]);
 }
 
 function createForm(reload, message) {

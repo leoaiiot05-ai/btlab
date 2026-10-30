@@ -3,7 +3,7 @@
 
 // A hash of the shell's contents, which tests/test_static.py recomputes: a changed shell file needs a new value, and the
 // changed worker then installs a fresh shell cache.
-const VERSION = "8f3ec22a8e67";
+const VERSION = "df35553dd25a";
 const SHELL_CACHE = `btlab-shell-${VERSION}`;
 const RESULTS_CACHE = "btlab-results";
 // Tailscale Serve answers these while btlab is down: no answer from btlab, like a failed network.

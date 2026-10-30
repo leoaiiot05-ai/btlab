@@ -12,7 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from btlab.config import load_config
 from btlab.jobs import JobRunning
 from btlab.plugins import PluginFolder
-from btlab.records import MinuteCoverage, to_day
+from btlab.records import ExternalSeries, ExternalSnapshot, MinuteCoverage, to_day
 from btlab.store import MinuteStore, Store
 from btlab.web import COOKIE, Services, make_app, session_value, start_site
 from builders import WEEKDAYS, put_bars
@@ -33,6 +33,7 @@ class StubJobs:
     def __init__(self) -> None:
         self.busy: set[str] = set()
         self.updates: list[str] = []
+        self.snapshots = 0
         self.cancelled: list[str] = []
         self.failure: Exception | None = None
 
@@ -46,6 +47,12 @@ class StubJobs:
             raise JobRunning("DATA")
         self.updates.append(market)
         return SimpleNamespace(lane="DATA", kind=f"UPDATE_{market}")
+
+    def snapshot(self) -> SimpleNamespace:
+        if "DATA" in self.busy:
+            raise JobRunning("DATA")
+        self.snapshots += 1
+        return SimpleNamespace(lane="DATA", kind="SPYLEAD_SNAPSHOT")
 
     def cancel(self, lane: str) -> bool:
         self.cancelled.append(lane)
@@ -481,3 +488,55 @@ def test_the_state_document_shows_the_next_updates_and_trade_limits(tmp_path):
     assert found["app"]["schedule"] == {"enabled": True,
                                         "next": {"US": "2026-10-29T00:35:00Z", "TW": "2026-10-28T10:05:00Z"}}
     assert found["app"]["limits"]["us_max_orders_per_day"] == 5 and found["app"]["mode"] == "trade"
+
+
+# ----- spylead (§5.6, AC-23) -----
+
+
+def test_spylead_routes_the_state_and_the_registry_show_the_stored_series(world):
+    first = to_day(datetime(2026, 1, 1).date())
+    world.store.replace_external_series(ExternalSnapshot(NOW, (
+        ExternalSeries("F", first, np.array([np.nan, 0.5, 0.25, np.nan]), True),
+        ExternalSeries("SPYL1", first, np.array([np.nan, np.nan]), False))))
+    reads_f = {"version": 1, "timeframe": "1d", "side": "long", "params": {},
+               "entry": {"left": {"series": "F"}, "op": "gt", "right": {"value": 0}},
+               "exit": {"left": {"series": "F"}, "op": "le", "right": {"value": 0}}}
+
+    async def scenario(client):
+        found = {
+            "spylead": await answer(await client.get("/api/spylead")),
+            "start": await answer(await client.post("/api/spylead/snapshot", json={})),
+            "registry": await answer(await client.get("/api/indicators")),
+            "valid": await answer(await client.post("/api/rules/validate", json={"rule": reads_f})),
+            "state": await answer(await client.get("/api/state")),
+        }
+        world.jobs.busy.add("DATA")
+        found["busy"] = await answer(await client.post("/api/spylead/snapshot", json={}))
+        return found
+
+    found = serve(world, scenario)
+    assert found["spylead"] == (200, {"configured": True, "snapshot_at": "2026-10-28T01:00:00Z", "series": [
+        {"name": "F", "in_sample": True, "first_day": "2026-01-02", "last_day": "2026-01-03"},
+        {"name": "SPYL1", "in_sample": False, "first_day": None, "last_day": None}]})
+    assert found["start"] == (202, {"lane": "DATA", "kind": "SPYLEAD_SNAPSHOT"}) and world.jobs.snapshots == 1
+    series = [(o["name"], o["in_sample"], o["timeframes"]) for o in found["registry"][1] if o["kind"] == "series"]
+    assert series == [("F", True, ["1d", "1m", "5m", "15m", "30m", "60m"]), ("SPYL1", False, ["1d", "1m", "5m", "15m", "30m", "60m"])]
+    assert found["valid"] == (200, {"ok": True, "errors": []})
+    assert found["state"][1]["app"]["services"] == {"spylead": {"configured": True, "snapshot_at": "2026-10-28T01:00:00Z",
+                                                                "series": 2}}
+    assert found["busy"][0] == 409 and found["busy"][1]["error"] == "JOB_RUNNING"
+
+
+def test_a_snapshot_needs_spylead_configured(tmp_path):
+    world = make_world(tmp_path, edited("spylead", "url", ""))
+    try:
+        async def scenario(client):
+            return [await answer(await client.post("/api/spylead/snapshot", json={})),
+                    await answer(await client.get("/api/spylead"))]
+
+        refused, shown = serve(world, scenario)
+    finally:
+        world.store.close()
+        world.minute.close()
+    assert refused[0] == 409 and refused[1]["error"] == "SPYLEAD_NOT_CONFIGURED" and world.jobs.snapshots == 0
+    assert shown == (200, {"configured": False, "snapshot_at": None, "series": []})
