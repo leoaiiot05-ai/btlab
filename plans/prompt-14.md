@@ -58,3 +58,11 @@ Covers SPEC.md §5 (budgets and windows), §17 (without §17.3, prompt 21, and t
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-18 holds for the parts of this prompt** (the follow-ups and LIVE_DATA_INCOMPLETE arrive with prompts 21 and 22), and the notifier part of AC-28. `.venv/bin/python -m pytest -q`: 1051 passed (also with `-X dev -W error`). `scheduler` joined the pure modules.
+- Built as planned. Stopping is cooperative for every job: `Job.check()` between steps, and `Job.race()` for sleeps, thread work and pool waits, so a stop before a job's first step is recorded too.
+- The store now serializes its connection with a lock and allows any thread; `setting` and `save_setting` replaced the private reader.
+- The optimizer's estimate uses the jobs' clock, so tests drive it.
+- **For prompt 15:** build `Jobs(store, minute_store, Keys(...), taxes, plugins, process_pool(default_workers()), default_workers(), notifier=make_notifier(config.email, config.mode))`, call `jobs.tick(config.schedule)` every minute from the event loop, `jobs.running()` feeds the state document's jobs, and `await jobs.interrupt()` at shutdown. **For prompt 16:** `jobs.backtest(raw)` and `jobs.optimization(raw)` raise `RunConfigError` or `OptimizeError` before any job; `await job.ready` gives the optimization's `NeedsConfirmation` (409) or None (202); `jobs.cancel(lane)`; `JobRunning` is 409.

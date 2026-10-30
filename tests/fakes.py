@@ -67,6 +67,13 @@ class FakeSession:
             raise AssertionError(f"unexpected request number {len(self.calls)}")
         return _Exchange(self.outcomes.pop(0))
 
+    async def __aenter__(self) -> "FakeSession":
+        """A job opens its session as `async with session_factory() as session` (§5.7)."""
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        return None
+
 
 class FakeTime:
     """An epoch-seconds clock that only the injected sleep moves. Every sleep is recorded."""
@@ -112,6 +119,9 @@ class InlinePool:
             return function(*call_args)
 
         return _LaterFuture(counted, args)
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        return None
 
     def __enter__(self) -> "InlinePool":
         return self

@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import sqlite3
+import threading
 from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -227,9 +228,11 @@ class _Database:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as error:
             raise StoreError(f"{self.path}: cannot create its folder ({error.strerror or type(error).__name__})") from error
+        # Jobs load and save in worker threads to keep the event loop free; the lock serializes the one connection.
+        self._lock = threading.RLock()
         try:
             # timeout sets the busy timeout; with autocommit=True every transaction is explicit.
-            self._db = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_S, autocommit=True)
+            self._db = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_S, autocommit=True, check_same_thread=False)
         except sqlite3.Error as error:
             raise self._error(error) from error
         try:
@@ -242,7 +245,8 @@ class _Database:
             raise
 
     def close(self) -> None:
-        self._db.close()
+        with self._lock:
+            self._db.close()
 
     def _prepare(self) -> None:
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
@@ -275,23 +279,25 @@ class _Database:
 
     def _read(self, sql: str, params: Sequence[Any] = ()) -> list[tuple]:
         try:
-            return self._db.execute(sql, params).fetchall()
+            with self._lock:
+                return self._db.execute(sql, params).fetchall()
         except sqlite3.Error as error:
             raise self._error(error) from error
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
         """One transaction: committed when the block ends, rolled back on any exception, so a failed write changes nothing."""
-        try:
-            self._db.execute("BEGIN IMMEDIATE")
-            yield self._db
-            self._db.execute("COMMIT")
-        except BaseException as error:
-            if self._db.in_transaction:
-                self._db.execute("ROLLBACK")
-            if isinstance(error, sqlite3.Error):
-                raise self._error(error) from error
-            raise
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                yield self._db
+                self._db.execute("COMMIT")
+            except BaseException as error:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                if isinstance(error, sqlite3.Error):
+                    raise self._error(error) from error
+                raise
 
     def _changes(self, sql: str, rows: list[tuple]) -> int:
         """Runs sql once per row in one transaction, and counts the rows it added, changed or removed."""
@@ -620,7 +626,7 @@ class Store(_Database):
     # ----- settings (§4.1, §5.1, §5.2) -----
 
     def data_start(self, market: str) -> int | None:
-        return self._setting(f"data_start/{market}")
+        return self.setting(f"data_start/{market}")
 
     def set_data_start(self, market: str, day: int) -> int:
         """Stores the market's data_start unless one is stored, and returns the stored day: the first value stays."""
@@ -630,23 +636,26 @@ class Store(_Database):
             db.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING", (key, _json(int(day)))
             )
-            return self._setting(key)
+            return self.setting(key)
 
     def request_log(self, source: str) -> list[float]:
         """The UTC epoch seconds of a source's past requests, kept so a restart does not reset its budget."""
-        return self._setting(f"request_log/{source}") or []
+        return self.setting(f"request_log/{source}") or []
 
     def save_request_log(self, source: str, times: Sequence[float]) -> None:
-        value = _json([float(moment) for moment in times])
+        self.save_setting(f"request_log/{source}", [float(moment) for moment in times])
+
+    def setting(self, key: str) -> Any:
+        """A JSON value of the settings table, or None."""
+        rows = self._read("SELECT value FROM settings WHERE key = ?", (key,))
+        return json.loads(rows[0][0]) if rows else None
+
+    def save_setting(self, key: str, value: Any) -> None:
         with self._write() as db:
             db.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                (f"request_log/{source}", value),
+                (key, _json(value)),
             )
-
-    def _setting(self, key: str) -> Any:
-        rows = self._read("SELECT value FROM settings WHERE key = ?", (key,))
-        return json.loads(rows[0][0]) if rows else None
 
     # ----- rules (§9.6) -----
 
