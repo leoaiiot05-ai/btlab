@@ -60,3 +60,10 @@ Covers SPEC.md §3, §4, §6 and §7 for the pure price layer. Acceptance: AC-4 
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-4 holds, and AC-5 except "orders wait for the next tradable bar"**, which the engine owns (prompt 6); `Aligned.tradable` and `Aligned.lock` are its inputs. `.venv/bin/python -m pytest -q`: 414 passed (also with `-X dev -W error`).
+- `tests/test_purity.py` checks the imports and clock or file calls of the pure modules so far (markets, records, calendar, prices); later prompts add theirs to `PURE`.
+- **Read before prompt 6:** `Aligned.cash` and `Aligned.ratio` are the corporate actions at each day's open; `Aligned.lock` is already masked to tradable bars; a carried day has volume 0 and is untradable; `multiplier` is NaN outside a symbol's data.
+- **For the owner (spec ambiguity):** §6.3's "A factor outside (0, 2] is ignored" contradicts example A6 when read literally; the code checks the factor net of the share ratio (see "Readings" above). If the owner meant something else, only `MAX_NET_FACTOR` and `_net_factor` in `prices.py` change.

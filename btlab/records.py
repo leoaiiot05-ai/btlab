@@ -89,6 +89,17 @@ class Action:
     ref_after: float | None = None
 
 
+@dataclass(frozen=True, eq=False)
+class DayEvents:
+    """One symbol's corporate actions by day, ascending (§6.3): the day's cash dividend per share (0 without), its share
+    ratio (1 without) and its adjustment factor g."""
+
+    day: np.ndarray
+    cash: np.ndarray
+    ratio: np.ndarray
+    factor: np.ndarray
+
+
 @dataclass(frozen=True)
 class ShortSuspension:
     """A TW short-sale suspension from start_day through end_day (§5.2, §10.7)."""
