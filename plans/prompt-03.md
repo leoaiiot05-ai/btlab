@@ -77,3 +77,13 @@ Covers SPEC.md §4.1, §5.1, §5.2, §5.3, §5.7, §6.2 (the raw inputs of the a
 ## 4. Deferred items (appended to TODO.md)
 
 - `Retry-After` as an HTTP date; today it counts as the 60 s default (Operations). Seam: `_retry_after` in `http.py`.
+
+## Result
+
+- **AC-3 holds.** `.venv/bin/python -m pytest -q`: 335 passed (also with `-X dev -W error`).
+- **Built as planned**, plus:
+  - `SourceError` accepts only the codes of §5.7 (`HTTP_<digits>` for statuses), so a typo cannot create a code that the UI cannot localize.
+  - FinMind's `msg` is quoted in errors without the token, should FinMind ever echo it; Tiingo's and FRED's error bodies are never quoted.
+  - A URL in a quoted message becomes `<link>`; the URL pattern stops before brackets, quotes and a sentence's last punctuation.
+- **No real connection.** The clients' tests use `tests/fakes.py`. One test runs `Requester` through aiohttp's own `ClientSession` against `aiohttp.test_utils.TestServer` on 127.0.0.1 (§24.1), so the real aiohttp calls (`get` with `params`, `headers` and `timeout`, `read`, the `Retry-After` header) are checked too.
+- **For prompt 14:** build one `RequestBudget(tiingo.LIMITS | finmind.LIMITS, store.request_log(source), partial(store.save_request_log, source))` per job and pass it to `Requester` with the job's `on_wait`; compute windows with `fetch_start` and the clients' `*_OVERLAP_DAYS`; count TIINGO_SYMBOL_BUDGET and FinMind's SYMBOL_UNKNOWN (absent from TaiwanStockInfo) there.

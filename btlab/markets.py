@@ -1,10 +1,12 @@
-"""Market constants (SPEC.md §4.1). Pure."""
+"""Market constants (SPEC.md §4.1) and the symbol rules of §7. Pure."""
 
+import re
 from dataclasses import dataclass
 from datetime import date, time
 
 # The first update of a market fixes data_start this many years back: 30 years plus a year of warm-up.
 DATA_START_YEARS = 31
+SYMBOL_PATTERNS = {"US": re.compile(r"[A-Z][A-Z0-9]{0,5}(\.[A-Z])?"), "TW": re.compile(r"[0-9]{4,6}[A-Z]?")}
 
 
 @dataclass(frozen=True)
@@ -109,3 +111,22 @@ TW = Market(
 )
 
 MARKETS = {market.code: market for market in (US, TW)}
+
+
+def normalize_symbol(market: str, text: str) -> str:
+    """The owner's symbol, stripped and uppercased; ValueError when it breaks the market's syntax (§7)."""
+    symbol = text.strip().upper()
+    if SYMBOL_PATTERNS[market].fullmatch(symbol) is None:
+        raise ValueError(f"not a {market} symbol")
+    return symbol
+
+
+def category_by_rule(market: str, symbol: str) -> str:
+    """The tax category a symbol gets until the owner overrides it (§7). US categories are informational."""
+    if market == "US":
+        return "STOCK"
+    if symbol.startswith("00"):
+        return "BOND_ETF" if symbol.endswith("B") else "ETF"
+    if len(symbol) == 6 and symbol.isdigit() and symbol.startswith("91"):
+        return "TDR"
+    return "STOCK"

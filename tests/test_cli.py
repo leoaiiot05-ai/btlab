@@ -116,3 +116,18 @@ def test_logging_follows_section_23(tmp_path, logging_sandbox):
     assert console.level == logging.INFO
     logging.getLogger("btlab.test").debug("a debug line")
     assert "a debug line" in (tmp_path / "logs" / "btlab.log").read_text(encoding="utf-8")
+
+
+def test_log_lines_are_redacted(tmp_path, logging_sandbox):
+    call, _ = logging_sandbox
+    call(setup_logging, tmp_path / "logs")
+    key = "Sentinel-Fred-Key-77aa"
+    logger = logging.getLogger("btlab.test")
+    logger.info("GET https://api.stlouisfed.org/fred/series/observations?series_id=DTB3&api_key=%s&file_type=json", key)
+    try:
+        raise RuntimeError(f"failed with headers {{'Authorization': 'Token {key}'}}")
+    except RuntimeError:
+        logger.exception("unexpected")
+    text = (tmp_path / "logs" / "btlab.log").read_text(encoding="utf-8")
+    assert key not in text
+    assert "api_key=***&file_type=json" in text and "'Authorization': 'Token ***'" in text

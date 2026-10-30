@@ -15,6 +15,8 @@ from btlab.markets import (
     PriceLimit,
     RateCommission,
     Session,
+    category_by_rule,
+    normalize_symbol,
 )
 
 
@@ -58,3 +60,31 @@ def test_the_constants_are_frozen(constant, attribute):
 def test_the_time_zones_resolve(market):
     # On Windows zoneinfo needs the tzdata package.
     assert ZoneInfo(market.time_zone).key == market.time_zone
+
+
+@pytest.mark.parametrize(
+    "market, text, symbol",
+    [("US", " brk.b ", "BRK.B"), ("US", "SPY", "SPY"), ("US", "goog", "GOOG"), ("TW", "2330", "2330"),
+     ("TW", "00679b", "00679B"), ("TW", "910322", "910322")],
+)
+def test_symbols_are_normalized(market, text, symbol):
+    assert normalize_symbol(market, text) == symbol
+
+
+@pytest.mark.parametrize(
+    "market, text",
+    [("US", "1ABC"), ("US", "TOOLONGX"), ("US", "BRK.BB"), ("US", "BRK-B"), ("US", ""), ("TW", "233"),
+     ("TW", "1234567"), ("TW", "2330AB"), ("TW", "SPY")],
+)
+def test_symbols_breaking_the_syntax_are_rejected(market, text):
+    with pytest.raises(ValueError, match=f"not a {market} symbol"):
+        normalize_symbol(market, text)
+
+
+@pytest.mark.parametrize(
+    "market, symbol, category",
+    [("TW", "00679B", "BOND_ETF"), ("TW", "0050", "ETF"), ("TW", "00632R", "ETF"), ("TW", "910322", "TDR"),
+     ("TW", "9105", "STOCK"), ("TW", "2330", "STOCK"), ("TW", "2330B", "STOCK"), ("US", "SPY", "STOCK")],
+)
+def test_categories_by_rule(market, symbol, category):
+    assert category_by_rule(market, symbol) == category

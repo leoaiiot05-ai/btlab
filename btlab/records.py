@@ -5,10 +5,11 @@ Times are aware UTC datetimes. Records that hold arrays are eq=False, so == neve
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 
+EPOCH = date(1970, 1, 1)
 CATEGORY_SOURCES = ("RULE", "OWNER")
 ACTION_KINDS = ("CASH_DIV", "SHARE_RATIO")
 COVERAGE_STATUSES = ("OK", "EMPTY", "FAILED", "NO_PERMISSION", "MISMATCH")
@@ -27,6 +28,15 @@ EVENT_KINDS = (
     # other
     "SETTING_CHANGED", "INTERNAL_ERROR",
 )
+
+
+def to_day(value: date) -> int:
+    """Days since 1970-01-01 (§3)."""
+    return value.toordinal() - EPOCH.toordinal()
+
+
+def to_date(day: int) -> date:
+    return EPOCH + timedelta(days=int(day))
 
 
 @dataclass(frozen=True)
@@ -85,6 +95,65 @@ class ShortSuspension:
 
     start_day: int
     end_day: int
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class StockInfo:
+    """A stock's latest TaiwanStockInfo row (§5.2). exchange is TWSE or TPEX, None for another type."""
+
+    symbol: str
+    name: str
+    exchange: str | None
+    industry: str
+
+
+@dataclass(frozen=True)
+class DividendResult:
+    """A TaiwanStockDividendResult row: an ex-date with its reference prices (§6.2). kind is 息, 權 or 權息."""
+
+    day: int
+    before_price: float
+    after_price: float
+    kind: str
+
+
+@dataclass(frozen=True)
+class DividendPolicy:
+    """A TaiwanStockDividend row: its cash dividend and the cash ex-date, None when it has none (§6.2)."""
+
+    cash_ex_day: int | None
+    cash: float
+
+
+@dataclass(frozen=True)
+class SplitPrice:
+    """A TaiwanStockSplitPrice row, a split or reverse split (§6.2)."""
+
+    day: int
+    symbol: str
+    type: str
+    before_price: float
+    after_price: float
+
+
+@dataclass(frozen=True)
+class ParValueChange:
+    """A TaiwanStockParValueChange row (§6.2)."""
+
+    day: int
+    symbol: str
+    before_close: float
+    after_ref_close: float
+
+
+@dataclass(frozen=True)
+class CapitalReduction:
+    """A TaiwanStockCapitalReductionReferencePrice row (§6.2)."""
+
+    day: int
+    closing_price: float
+    reference_price: float
     reason: str | None
 
 
