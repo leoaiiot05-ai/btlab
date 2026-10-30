@@ -3,22 +3,29 @@ corporate actions and ledger. Pure.
 """
 
 import math
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 import numpy as np
 
 from btlab.calendar import price_limit_pct
+from btlab.config import Limits
 from btlab.costs import CostModel
 from btlab.markets import MARKETS
 from btlab.records import Line, to_date
 
 BATCH_STATUSES = ("PROPOSED", "CONFIRMED", "SENT", "DONE", "EXPIRED", "REPLACED")
 SKIPS = ("SKIPPED_TW_SHORT", "SKIPPED_NO_PRICE", "SKIPPED_OWNER")
-# Test mode's line states; trade mode adds its own with sending (§15.5).
-LINE_STATUSES = ("PROPOSED", *SKIPS, "VIRTUAL_PENDING", "FILLED", "EXPIRED")
+# Trade mode's (§14.2, §15, §16.2): lines it cannot or may not send, and lines a stopped batch never sent.
+TRADE_SKIPS = ("SKIPPED_NO_CONTRACT", "SKIPPED_MIN_SIZE", "SKIPPED_NO_PRICE_RULE", "BLOCKED_LIMIT",
+               "SKIPPED_IBGUARD_UNREACHABLE", "SKIPPED_IBGUARD_EXITING", "SKIPPED_IBGUARD_EXCLUDE_FAILED", "REFUSED",
+               "NOT_SENT")
+# An order's life at IB (§15.5); FILLED and EXPIRED also end a virtual line (§14.5).
+ORDER_STATES = ("SENT", "WORKING", "FILLED", "PARTIAL", "CANCELLED", "REJECTED", "EXPIRED")
+ENDED = ("FILLED", "PARTIAL", "CANCELLED", "REJECTED", "EXPIRED")
+LINE_STATUSES = ("PROPOSED", *SKIPS, *TRADE_SKIPS, "VIRTUAL_PENDING", "CONFIRMED", *ORDER_STATES)
 TW_LOT = 1000.0
 # The last moment to confirm a batch, on its session day (§14.4).
 CUTOFFS = {"US": time(9, 20), "TW": time(8, 50)}
@@ -109,6 +116,38 @@ def limit_price(market: str, action: str, reference: float, offset_pct: float, s
         return price
     limit = float(price_limit_pct(market, np.array([session_day]))[0]) / 100
     return min(max(price, reference * (1 - limit)), reference * (1 + limit))
+
+
+def apply_limits(lines: list[Line], equity: float, limits: Limits, market: str) -> list[Line]:
+    """The limits of §15.3 on the PROPOSED lines: above the value or the share of equity, BLOCKED_LIMIT; past the
+    count, the largest lines stay and the rest are BLOCKED_LIMIT."""
+    us = market == "US"
+    max_value = limits.us_max_order_value if us else limits.tw_max_order_value
+    max_count = limits.us_max_orders_per_day if us else limits.tw_max_orders_per_day
+    max_share = limits.max_order_pct_of_equity / 100 * equity
+    checked = []
+    for line in lines:
+        value = line.quantity * line.ref_price
+        if line.status == "PROPOSED" and value > max_value:
+            line = replace(line, status="BLOCKED_LIMIT", reason=f"value {value:,.0f} above the limit {max_value:,.0f}")
+        elif line.status == "PROPOSED" and value > max_share:
+            line = replace(line, status="BLOCKED_LIMIT",
+                           reason=f"value {value:,.0f} above {limits.max_order_pct_of_equity:g}% of the equity")
+        checked.append(line)
+    proposed = sorted((k for k, line in enumerate(checked) if line.status == "PROPOSED"),
+                      key=lambda k: checked[k].quantity * checked[k].ref_price, reverse=True)
+    for k in proposed[max_count:]:
+        checked[k] = replace(checked[k], status="BLOCKED_LIMIT", reason=f"more than {max_count} orders in a session")
+    return checked
+
+
+def rule_price(price: float, increments: Sequence[tuple[float, float]], action: str) -> float:
+    """A limit price on the tick grid of the contract's market rule: buys round down, sells up (§15.2). increments are
+    IB's (low edge, increment) pairs."""
+    increment = max(increments, key=lambda pair: pair[0] if pair[0] <= price else -math.inf)[1]
+    ticks = price / increment
+    ticks = math.floor(ticks + 1e-9) if action == "BUY" else math.ceil(ticks - 1e-9)
+    return round(ticks * increment, 10)
 
 
 def cutoff(market: str, session_day: int) -> datetime:

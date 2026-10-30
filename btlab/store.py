@@ -28,6 +28,7 @@ from btlab.records import (
     Contract,
     DailyBars,
     Event,
+    Exclusion,
     ExternalSeries,
     ExternalSnapshot,
     JobRun,
@@ -880,10 +881,10 @@ class Store(_Database):
             )
             batch_id = cursor.lastrowid
             db.executemany(
-                "INSERT INTO live_orders (batch_id, line, symbol, action, quantity, kind, limit_price, ref_price, status,"
-                " reason, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [(batch_id, number, line.symbol, line.action, line.quantity, line.kind, line.limit_price, line.ref_price,
-                  line.status, line.reason, _iso(created_at)) for number, line in enumerate(lines, 1)],
+                "INSERT INTO live_orders (batch_id, line, symbol, con_id, action, quantity, kind, limit_price, ref_price,"
+                " status, reason, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(batch_id, number, line.symbol, line.con_id, line.action, line.quantity, line.kind, line.limit_price,
+                  line.ref_price, line.status, line.reason, _iso(created_at)) for number, line in enumerate(lines, 1)],
             )
         return batch_id
 
@@ -921,6 +922,57 @@ class Store(_Database):
                     db.execute("UPDATE live_orders SET status = ?, updated_at = ? WHERE id = ?",
                                (chosen_status if order_id in chosen else "SKIPPED_OWNER", stamp, order_id))
             db.execute("UPDATE live_batches SET status = 'CONFIRMED', confirmed_at = ? WHERE id = ?", (stamp, batch_id))
+
+    def update_order(self, order_id: int, updated_at: datetime, **changes: Any) -> None:
+        """A line's state as trade mode follows it (§15.5): status, reason, order_ref, ib_order_id and its fill."""
+        unknown = set(changes) - _ORDER_CHANGES
+        if unknown:
+            raise ValueError(f"live orders have no field {', '.join(sorted(unknown))}")
+        columns = ", ".join(f"{name} = ?" for name in changes)
+        with self._write() as db:
+            db.execute(f"UPDATE live_orders SET {columns}, updated_at = ? WHERE id = ?",
+                       (*changes.values(), _iso(updated_at), order_id))
+
+    def order(self, order_id: int) -> LiveOrder | None:
+        rows = self._read(f"SELECT {_ORDER_COLUMNS} FROM live_orders WHERE id = ?", (order_id,))
+        return _order(*rows[0]) if rows else None
+
+    def save_ledger(self, portfolio_id: int, row: LedgerRow) -> None:
+        """A trade-mode ledger row (§14.6); its holdings are IB's, so no virtual book changes."""
+        with self._write() as db:
+            db.execute("INSERT OR REPLACE INTO live_ledger (portfolio_id, day, cash, equity, holdings) VALUES (?, ?, ?, ?, ?)",
+                       (portfolio_id, row.day, row.cash, row.equity, _json(row.holdings)))
+
+    def order_by_ref(self, order_ref: str) -> LiveOrder | None:
+        """The line an order belongs to, by its exact orderRef (§15.7)."""
+        rows = self._read(f"SELECT {_ORDER_COLUMNS} FROM live_orders WHERE order_ref = ?", (order_ref,))
+        return _order(*rows[0]) if rows else None
+
+    def orders_with_status(self, *statuses: str) -> list[LiveOrder]:
+        marks = ", ".join("?" * len(statuses))
+        rows = self._read(f"SELECT {_ORDER_COLUMNS} FROM live_orders WHERE status IN ({marks}) ORDER BY id", statuses)
+        return [_order(*row) for row in rows]
+
+    def add_exclusion(self, order_id: int, con_id: int, symbol: str, excluded_at: datetime) -> int:
+        """btlab lifted ibguard's protection for a line's order (§16.2): an ACTIVE row."""
+        with self._write() as db:
+            cursor = db.execute(
+                "INSERT INTO ibguard_exclusions (order_id, con_id, symbol, state, excluded_at) VALUES (?, ?, ?, 'ACTIVE', ?)",
+                (order_id, con_id, symbol, _iso(excluded_at)),
+            )
+        return cursor.lastrowid
+
+    def exclusions(self, state: str = "ACTIVE") -> list[Exclusion]:
+        rows = self._read("SELECT id, order_id, con_id, symbol, state, excluded_at, resolved_at FROM ibguard_exclusions"
+                          " WHERE state = ? ORDER BY id", (state,))
+        return [Exclusion(id_, order_id, con_id, symbol, state_, _moment(at), _moment(resolved))
+                for id_, order_id, con_id, symbol, state_, at, resolved in rows]
+
+    def resolve_exclusion(self, exclusion_id: int, state: str, resolved_at: datetime) -> None:
+        """RESTORED or CLOSED (§16.2 step 6)."""
+        with self._write() as db:
+            db.execute("UPDATE ibguard_exclusions SET state = ?, resolved_at = ? WHERE id = ?",
+                       (state, _iso(resolved_at), exclusion_id))
 
     def holdings(self, portfolio_id: int) -> dict[str, float]:
         """The virtual book's shares by symbol (test mode, §14.5)."""
@@ -1167,6 +1219,7 @@ def _backtest(id_: int, created_at: str, name: str, market: str, timeframe: str,
 
 
 _PORTFOLIO_COLUMNS = "id, market, mode, backtest_id, config, capital, created_at, first_day, active"
+_ORDER_CHANGES = {"status", "reason", "order_ref", "ib_order_id", "filled_qty", "avg_price", "commission"}
 _BATCH_COLUMNS = "id, portfolio_id, session_day, created_at, status, confirmed_at, positions_seen"
 _ORDER_COLUMNS = ("id, batch_id, line, symbol, con_id, action, quantity, kind, limit_price, ref_price, status, reason,"
                   " order_ref, ib_order_id, filled_qty, avg_price, commission, updated_at")

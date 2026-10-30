@@ -294,6 +294,7 @@ class Line:
     ref_price: float
     status: str
     reason: str | None = None
+    con_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -332,6 +333,19 @@ class LiveBatch:
     confirmed_at: datetime | None
     positions_seen: dict
     lines: tuple[LiveOrder, ...]
+
+
+@dataclass(frozen=True)
+class Exclusion:
+    """ibguard's protection that btlab lifted for one of its orders (§16.2): ACTIVE, RESTORED or CLOSED."""
+
+    id: int
+    order_id: int
+    con_id: int
+    symbol: str
+    state: str
+    excluded_at: datetime
+    resolved_at: datetime | None
 
 
 @dataclass(frozen=True)
