@@ -17,6 +17,8 @@ from btlab.indicators import atr as average_true_range
 # On a tie, stops win over profit exits; within each group, this order decides (§10.8).
 STOPS = ("SL", "TRAIL", "ATR", "IBG_SL")
 PROFITS = ("TP", "IBG_TP")
+# The exit reasons the overlays give their trades; the UI localizes each.
+REASONS = (*STOPS, *PROFITS, "MAX_HOLD")
 
 
 @dataclass(frozen=True)

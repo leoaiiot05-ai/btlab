@@ -40,3 +40,44 @@ Covers SPEC.md §19 (state document, payloads, errors), §20 (items 1 to 4 and 8
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **The AC-21 checks of this prompt pass.** `.venv/bin/python -m pytest -q`: 1141 passed (also with `-X dev -W error`). `tests/test_static.py` collects the codes from the Python constants and from the codes `web.py` and `optimize.py` raise, and also checks that every literal `t("…")` key the UI asks for exists.
+- Built as planned. Every module also parses under Node's ES-module checker, and a scratch smoke run here (headless Chromium against the web layer over temporary stores, not `python -m btlab`) logged in, opened every view at 375 px and 1280 px without a page error, and ran a backtest from the form in zh-TW through to its BACKTEST_SAVED event on Home. That run found two bugs, fixed before this commit: a duplicate function name in `views/data.js`, and a wide table that widened the whole page on a phone instead of scrolling inside its container.
+- Full-page screenshots draw the sticky header and tab bar where the page was scrolled; on a device they stay at the top and the bottom.
+
+### Manual checklist for the owner (on the PC and the devices)
+
+Devices:
+- [ ] Edge on the PC: open `http://127.0.0.1:8091`, install it as an app (Edge menu → Apps → Install), and reopen it from the Start menu: it opens without the address bar.
+- [ ] Edge in light and dark (Windows Settings → Personalization → Colors): text, borders and the badge stay legible in both.
+- [ ] Both languages: switch between 中文 and English in the header and in Settings; every label changes, codes (outcomes, phases, event kinds) read as words, and the choice survives a restart.
+- [ ] iPhone at 375 px, portrait, through Tailscale Serve (HTTPS): no horizontal page scroll on any view, tables scroll inside their own frames, the bottom tab bar clears the home indicator, every button is easy to hit with a thumb.
+- [ ] iPad through Tailscale Serve, portrait and landscape: the side bar appears from 900 px, the bottom tab bar below that.
+- [ ] Add to the home screen on the iPhone and the iPad (Share → Add to Home Screen): the icon is the green rising line on dark blue, and the app opens standalone.
+
+Login and logout:
+- [ ] A wrong token waits about a second, then says the token is wrong; the right one opens Home.
+- [ ] Log out from the header and from Settings: the login form returns, and a reload stays on it.
+- [ ] The badge says TEST in test mode; in trade mode it says TRADE (with paper or live once IB reports the account), and a live account adds the red banner.
+
+Lists, symbols and updates:
+- [ ] Create a US list and a TW list; a duplicate name says the name is in use.
+- [ ] Add symbols (lower case is fine), reorder them with ↑ and ↓, remove one with ×, rename the list, delete a list (with its confirmation).
+- [ ] A bad symbol is marked at the "Add symbols" field.
+- [ ] In the symbols table: override a category, switch minute bars on and off, purge an unlisted symbol (with its confirmation); purging a listed one says it is in use.
+- [ ] Press Update US: Home and Data show the job, its phase, the symbol being fetched and the progress, every 2 s; when it ends, the event list shows the outcome and the symbols table refreshes. A second press while it runs says a job is running. Cancel works from Home.
+
+The backtest form:
+- [ ] A built-in (for example MA_CROSS): change the market and see the costs, capital and benchmark switch to that market's defaults; the parameter form follows the strategy; steppers respect each parameter's range.
+- [ ] A plugin: the example plugins appear, and a broken plugin file in `strategies/` is listed with its error after Settings → reload or a restart.
+- [ ] A rule: pick a saved rule, or open the rule builder and use its rule; the timeframe follows the rule.
+- [ ] Invalid input (empty name, start after end, fast not below slow) is shown at the field itself, and anything without a field is listed under the form.
+- [ ] A valid run says it is running, and BACKTEST_SAVED appears on Home.
+
+The rule builder:
+- [ ] Build an entry with ALL, ANY and NOT groups; the "Add group" button disappears at the third level.
+- [ ] Choose an operand that does not fit the timeframe (for example a minute feature on a minute rule, or VWAP on a daily rule): the error appears at that operand within a moment.
+- [ ] Refer an argument to a parameter, then rename or delete the parameter: the unknown-parameter error appears at the argument.
+- [ ] Save under a name, change it, save again; a second rule with the same name says the name is in use; load it back from "Saved rules"; the JSON view shows the rule.

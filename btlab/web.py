@@ -63,6 +63,12 @@ HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
 }
+HTTP_CODES = {404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED"}
+# Named here because Windows' registry can map .js to text/plain, which browsers refuse for modules.
+CONTENT_TYPES = {
+    ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json",
+    ".webmanifest": "application/manifest+json", ".png": "image/png",
+}
 
 log = logging.getLogger(__name__)
 
@@ -173,7 +179,7 @@ async def _errors(request: web.Request, handler: Callable) -> web.StreamResponse
     except web.HTTPException as error:
         if not request.path.startswith("/api/"):
             raise
-        code = {404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED"}.get(error.status, f"HTTP_{error.status}")
+        code = HTTP_CODES.get(error.status, f"HTTP_{error.status}")
         return ApiError(error.status, code, error.reason).response()
     except Exception as error:
         log.exception("%s %s failed", request.method, request.path)
@@ -515,9 +521,20 @@ async def cancel(request: web.Request) -> web.Response:
 # ----- strategies, indicators and rules (§8.6, §9) -----
 
 
+def _defaults(market: str) -> dict:
+    """A market's defaults for the run form (§4.1), as the configuration's validation fills them."""
+    spec = MARKETS[market]
+    fee = {"borrow_fee_pct": spec.borrow_fee_pct} if market == "US" else {"short_fee_pct": spec.short_fee_pct}
+    return {"initial_capital": spec.initial_capital, "benchmark": spec.benchmark, "categories": list(spec.categories),
+            "costs": {"commission": asdict(spec.commission), "slippage_bps": spec.slippage_bps,
+                      "dividend_withholding_pct": spec.dividend_withholding_pct, **fee}}
+
+
 def _strategies(folder: PluginFolder) -> dict:
-    """Built-ins with their schema per market, plugins with theirs, and the plugins that failed to load (§9.5)."""
+    """Built-ins with their schema per market, plugins with theirs, the plugins that failed to load (§9.5), and each
+    market's defaults for the run form."""
     return {
+        "defaults": {market: _defaults(market) for market in MARKETS},
         "builtins": [
             {"id": b.id, "name_en": b.name_en, "name_zh": b.name_zh, "output": b.output,
              "params": {market: {name: p.document() for name, p in b.schema(market, ()).items()} for market in MARKETS}}
@@ -979,4 +996,5 @@ async def static(request: web.Request) -> web.FileResponse:
     path = (STATIC / (request.match_info["path"] or "index.html")).resolve()
     if not path.is_relative_to(STATIC) or not path.is_file():
         raise web.HTTPNotFound()
-    return web.FileResponse(path)
+    content_type = CONTENT_TYPES.get(path.suffix)
+    return web.FileResponse(path, headers={"Content-Type": content_type} if content_type else None)

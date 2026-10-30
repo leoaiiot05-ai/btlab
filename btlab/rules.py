@@ -19,6 +19,9 @@ from btlab.params import Param, parse_schema
 from btlab.registry import EVERY, Arg, Operand, default_args, operands
 
 VERSION = 1
+# §9.6's codes, and INVALID_FIELD for the document's own structure.
+ISSUE_CODES = ("UNKNOWN_INDICATOR", "BAD_ARGS", "BAD_OP", "DEPTH", "TF_MISMATCH", "UNKNOWN_PARAM", "UNKNOWN_SERIES",
+               "TOO_MANY_CONDITIONS", "INVALID_FIELD")
 SIDES = ("long", "short")
 OPS = ("gt", "lt", "ge", "le", "cross_above", "cross_below")
 MAX_DEPTH = 3

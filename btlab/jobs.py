@@ -50,6 +50,9 @@ _END_EVENTS = {
     "NEEDS_CONFIRMATION": ("INFO", "JOB_CANCELLED"),
 }
 _SAVED_EVENTS = {"BACKTEST": "BACKTEST_SAVED", "OPTIMIZE": "OPTIMIZATION_SAVED"}
+# What a job's progress and record show; the UI localizes each.
+PHASES = ("CALENDAR", "INFO", "BARS", "ACTIONS", "RATES", "LOAD", "CHECK", "SIMULATE", "SAVE")
+OUTCOMES = (*_END_EVENTS, "DONE")
 
 log = logging.getLogger(__name__)
 

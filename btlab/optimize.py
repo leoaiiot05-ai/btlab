@@ -42,6 +42,9 @@ from btlab.taxes import TaxTable
 MAX_COMBINATIONS = 2_000
 OBJECTIVES = {"SHARPE": "sharpe", "CAGR": "cagr", "SORTINO": "sortino", "CALMAR": "calmar", "PROFIT_FACTOR": "profit_factor"}
 MODES = ("GRID", "OOS", "WFO")
+# The phases of an optimization's progress, and a walk-forward window's status; the UI localizes each.
+PHASES = ("ESTIMATE", *MODES)
+WINDOW_STATUSES = ("OK", "NO_RESULT")
 MIN_TRADES = 20
 CONFIRM_SECONDS = 600.0
 IN_SAMPLE_SHARE = 0.7
