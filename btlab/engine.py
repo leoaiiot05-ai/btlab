@@ -13,7 +13,7 @@ from btlab.costs import CostModel
 from btlab.indicators import atr as average_true_range
 from btlab.markets import MARKETS
 from btlab.prices import Aligned
-from btlab.records import ShortSuspension
+from btlab.records import ShortSuspension, Trade
 from btlab.sizing import Sizing, cap, entry_quantity, to_lot
 
 # A weight that moved less than this is unchanged (§9.1).
@@ -100,24 +100,6 @@ class Settings:
     board_lots_only: bool = False
     max_position_pct: float = 100.0
     suspensions: tuple[tuple[ShortSuspension, ...], ...] = ()
-
-
-@dataclass(frozen=True)
-class Trade:
-    """A closed or OPEN trade (§10.5). quantity is the total entered; prices are averages; pnl is net of every cost and
-    dividend attributable to the trade; return_pct is pnl over the entered value."""
-
-    symbol: str
-    side: str
-    quantity: float
-    entry_time: int
-    entry_price: float
-    exit_time: int
-    exit_price: float
-    pnl: float
-    return_pct: float
-    costs: float
-    exit_reason: str
 
 
 @dataclass(frozen=True)

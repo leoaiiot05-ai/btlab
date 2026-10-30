@@ -23,6 +23,7 @@ from btlab.records import (
     EVENT_KINDS,
     EVENT_LEVELS,
     Action,
+    BacktestRow,
     Contract,
     DailyBars,
     Event,
@@ -35,9 +36,11 @@ from btlab.records import (
     ShortSuspension,
     SymbolInfo,
     SymbolList,
+    Trade,
 )
 
 SCHEMA_VERSION = 1
+SERIES_KINDS = ("TIME", "EQUITY", "BENCHMARK", "CASH", "GROSS", "NET", "POSITIONS")
 BUSY_TIMEOUT_S = 1.0
 # The coverage states of a day that has bars (§5.4).
 WITH_BARS = ("OK", "MISMATCH")
@@ -642,6 +645,77 @@ class Store(_Database):
     def _setting(self, key: str) -> Any:
         rows = self._read("SELECT value FROM settings WHERE key = ?", (key,))
         return json.loads(rows[0][0]) if rows else None
+
+    # ----- backtest results (§10.11, §17.5) -----
+
+    def save_backtest(
+        self,
+        created_at: datetime,
+        name: str,
+        market: str,
+        timeframe: str,
+        config: dict,
+        data_stamp: dict,
+        metrics: dict,
+        tables: dict,
+        flags: dict,
+        series: dict[str, np.ndarray],
+        trades: Sequence[Trade],
+    ) -> int:
+        """Saves a result with its series (float64 BLOBs) and its trades in one transaction; returns its id."""
+        unknown = set(series) - set(SERIES_KINDS)
+        if unknown:
+            raise ValueError(f"unknown series {sorted(unknown)}")
+        documents = [_json(document) for document in (config, data_stamp, metrics, tables, flags)]
+        blobs = [(kind, _blob(values)) for kind, values in series.items()]
+        with self._write() as db:
+            backtest_id = db.execute(
+                "INSERT INTO backtests (created_at, name, market, timeframe, config, data_stamp, metrics, tables, flags)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (_iso(created_at), name, market, timeframe, *documents),
+            ).lastrowid
+            db.executemany(
+                "INSERT INTO backtest_series (backtest_id, kind, values_blob) VALUES (?, ?, ?)",
+                [(backtest_id, kind, blob) for kind, blob in blobs],
+            )
+            db.executemany(
+                "INSERT INTO trades (backtest_id, seq, symbol, side, quantity, entry_time, entry_price, exit_time,"
+                " exit_price, pnl, return_pct, costs, exit_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (backtest_id, seq, t.symbol, t.side, t.quantity, t.entry_time, t.entry_price, t.exit_time,
+                     _real(t.exit_price), _real(t.pnl), _real(t.return_pct), t.costs, t.exit_reason)
+                    for seq, t in enumerate(trades, 1)
+                ],
+            )
+        return backtest_id
+
+    def backtest(self, backtest_id: int) -> BacktestRow | None:
+        rows = self._read(
+            "SELECT id, created_at, name, market, timeframe, config, data_stamp, metrics, tables, flags, keep_offline,"
+            " opened_at FROM backtests WHERE id = ?",
+            (backtest_id,),
+        )
+        if not rows:
+            return None
+        id_, created_at, name, market, timeframe, *documents, keep_offline, opened_at = rows[0]
+        config, data_stamp, metrics, tables, flags = (json.loads(document) for document in documents)
+        return BacktestRow(
+            id_, _moment(created_at), name, market, timeframe, config, data_stamp, metrics, tables, flags,
+            bool(keep_offline), _moment(opened_at),
+        )
+
+    def backtest_series(self, backtest_id: int) -> dict[str, np.ndarray]:
+        rows = self._read("SELECT kind, values_blob FROM backtest_series WHERE backtest_id = ?", (backtest_id,))
+        return {kind: _array(blob) for kind, blob in rows}
+
+    def backtest_trades(self, backtest_id: int, offset: int = 0, limit: int | None = None) -> list[Trade]:
+        """A result's trades in order; limit None reads them all."""
+        rows = self._read(
+            "SELECT symbol, side, quantity, entry_time, entry_price, exit_time, exit_price, pnl, return_pct, costs,"
+            " exit_reason FROM trades WHERE backtest_id = ? ORDER BY seq LIMIT ? OFFSET ?",
+            (backtest_id, -1 if limit is None else limit, offset),
+        )
+        return [Trade(*row) for row in rows]
 
     # ----- events and job runs (§17.1, §18) -----
 

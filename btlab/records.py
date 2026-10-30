@@ -228,6 +228,43 @@ class JobRun:
     message: str | None
 
 
+@dataclass(frozen=True)
+class Trade:
+    """A closed or OPEN trade of a backtest (§10.5). quantity is the total entered; prices are averages; pnl is net of
+    every cost and dividend attributable to the trade; return_pct is pnl over the entered value. Times are day
+    numbers on the daily timeline and UTC epoch seconds on minute timelines."""
+
+    symbol: str
+    side: str
+    quantity: float
+    entry_time: int
+    entry_price: float
+    exit_time: int
+    exit_price: float
+    pnl: float
+    return_pct: float
+    costs: float
+    exit_reason: str
+
+
+@dataclass(frozen=True)
+class BacktestRow:
+    """A saved backtest without its series and trades (§18); config, data_stamp, metrics, tables and flags are JSON."""
+
+    id: int
+    created_at: datetime
+    name: str
+    market: str
+    timeframe: str
+    config: dict
+    data_stamp: dict
+    metrics: dict
+    tables: dict
+    flags: dict
+    keep_offline: bool
+    opened_at: datetime | None
+
+
 @dataclass(frozen=True, eq=False)
 class MinuteBars:
     """One symbol's 1-minute bars of the regular session in raw prices, ordered by t (§6.6)."""
