@@ -6,8 +6,8 @@ import {BENCHMARK, DOWN, STRATEGY, UP} from "../lib/colors.js";
 import {button, checkbox, clear, h, select} from "../lib/dom.js";
 import {code, current, day, errorText, moment, t} from "../lib/i18n.js";
 import {KINDS, METRICS, format, tone, toneOf} from "../lib/metrics.js";
+import {TRADES_PAGE, stored} from "../lib/offline.js";
 
-const TRADES_PAGE = 50;
 const SHOWN_IN_LIST = ["total_return", "cagr", "sharpe", "max_drawdown", "trades"];
 const COMPARED = 4;
 
@@ -38,7 +38,7 @@ async function list(root, context) {
     const text = name.value.trim().toLowerCase();
     for (const row of rows.filter((item) => (!market.value || item.market === market.value) && item.name.toLowerCase().includes(text))) {
       body.append(h("tr", {},
-        h("td", {}, checkbox(chosen.has(row.id), (on) => {
+        h("td", {}, context.offline ? null : checkbox(chosen.has(row.id), (on) => {
           if (on) chosen.add(row.id); else chosen.delete(row.id);
           compare.disabled = chosen.size < 2 || chosen.size > COMPARED;
         })),
@@ -56,11 +56,19 @@ async function list(root, context) {
   market.addEventListener("change", draw);
   name.addEventListener("input", draw);
   try {
-    rows = await get("/api/backtests?limit=1000");
+    // Offline the list holds the stored results only (§20.5).
+    rows = context.offline ? (await stored()).map(summary) : await get("/api/backtests?limit=1000");
     draw();
   } catch (error) {
     message.textContent = errorText(error);
   }
+}
+
+function summary(detail) {
+  // A stored detail in the shape of a row of GET /api/backtests.
+  const config = detail.config;
+  return {...detail, strategy: config.strategy, period: {start: config.start, end: config.end}, metrics: detail.metrics.strategy,
+    flags: Object.keys(detail.flags)};
 }
 
 // ----- a result -----
@@ -76,6 +84,7 @@ async function page(root, context, id) {
     message.textContent = errorText(error);
     return;
   }
+  context.sync(id);
   const config = detail.config;
   root.append(
     h("h2", {text: detail.name}),
@@ -90,7 +99,8 @@ async function page(root, context, id) {
     h("h3", {text: t("results.monthly")}), monthlyChart(detail.tables.strategy.monthly),
     h("h3", {text: t("results.annual")}), annualChart(detail.tables.strategy.annual),
     h("h3", {text: t("results.exposure")}), exposureChart(series),
-    h("h3", {text: t("results.candles")}), candles(detail),
+    // The cache holds no candles (§20.5).
+    h("h3", {text: t("results.candles")}), context.offline ? h("p", {class: "quiet", text: t("results.offline_candles")}) : candles(detail),
     h("h3", {text: t("results.trades")}), trades(detail));
 }
 
@@ -115,11 +125,14 @@ function when(value, detail) {
 }
 
 function actions(detail, context, message) {
+  if (context.offline) return h("p", {class: "quiet", text: t("results.offline_actions")});
   const name = h("input", {type: "text", value: detail.name});
   const change = async (body) => {
     try {
       await patch(`/api/backtests/${detail.id}`, body);
       message.textContent = t("results.saved");
+      // The stored copy follows the new name, and keep offline changes what is stored.
+      context.sync(detail.id);
     } catch (error) {
       message.textContent = errorText(error);
     }
@@ -137,6 +150,7 @@ function actions(detail, context, message) {
       if (!confirm(t("results.confirm_delete", {name: detail.name}))) return;
       try {
         await remove(`/api/backtests/${detail.id}`);
+        context.sync();
         context.go("results");
       } catch (error) {
         message.textContent = errorText(error);
@@ -308,7 +322,14 @@ function trades(detail) {
   const status = h("span", {class: "detail"});
   let offset = 0;
   const load = async () => {
-    const found = await get(`/api/backtests/${detail.id}/trades?offset=${offset}&limit=${TRADES_PAGE}`);
+    let found;
+    try {
+      found = await get(`/api/backtests/${detail.id}/trades?offset=${offset}&limit=${TRADES_PAGE}`);
+    } catch (error) {
+      // Offline only the first page is stored.
+      status.textContent = errorText(error);
+      return;
+    }
     clear(body);
     for (const trade of found.trades) {
       body.append(h("tr", {},

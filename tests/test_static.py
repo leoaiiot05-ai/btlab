@@ -1,4 +1,5 @@
-"""The static UI: locales, safe DOM use, the manifest and its icons, and the vendored ECharts (SPEC.md §20, §21, AC-21)."""
+"""The static UI: locales, safe DOM use, the manifest and its icons, the vendored ECharts, and the service worker and
+offline mode (SPEC.md §20, §21, AC-21, AC-22)."""
 
 import hashlib
 import json
@@ -24,6 +25,11 @@ ECHARTS = STATIC / "vendor" / "echarts" / "echarts.min.js"
 ECHARTS_SHA256 = "b66b25aeb4df84e33199dc21694014d336d222cbd9deb0e5a7c14bd6aa0d0fd0"
 OURS = sorted(path for path in STATIC.rglob("*") if path.is_file() and "vendor" not in path.relative_to(STATIC).parts
               and path.suffix in (".html", ".js", ".css", ".json", ".webmanifest"))
+WORKER = STATIC / "sw.js"
+OFFLINE = STATIC / "lib" / "offline.js"
+OFFLINE_STRINGS = ("shell.offline", "shell.needs_connection", "shell.saved_results", "error.OFFLINE", "results.offline_actions",
+                   "results.offline_candles", "settings.offline", "settings.offline_detail", "settings.offline_count",
+                   "settings.clear_offline")
 FORBIDDEN = {
     "innerHTML": r"innerHTML", "outerHTML": r"outerHTML", "insertAdjacentHTML": r"insertAdjacentHTML",
     "document.write": r"document\.write", "inline script": r"<script(?![^>]*\bsrc=)[^>]*>",
@@ -34,6 +40,11 @@ FORBIDDEN = {
 
 def locale(name: str) -> dict[str, str]:
     return json.loads((STATIC / "locales" / f"{name}.json").read_text(encoding="utf-8"))
+
+
+def committed_bytes(path: Path) -> bytes:
+    """A file's bytes with the LF line endings it is committed with: a Windows checkout may turn them into CRLF."""
+    return path.read_bytes().replace(b"\r\n", b"\n")
 
 
 def raised_codes(module, exception: str) -> set[str]:
@@ -144,5 +155,69 @@ def test_the_chart_colours_make_up_green_and_down_red():
 
 
 def test_the_vendored_echarts_is_untouched():
-    assert hashlib.sha256(ECHARTS.read_bytes()).hexdigest() == ECHARTS_SHA256
+    assert hashlib.sha256(committed_bytes(ECHARTS)).hexdigest() == ECHARTS_SHA256
     assert {path.name for path in ECHARTS.parent.iterdir()} >= {"echarts.min.js", "LICENSE", "NOTICE"}
+
+
+# ----- the service worker and offline mode (AC-22) -----
+
+
+def shell_files() -> list[str]:
+    """What the worker must pre-cache: the page (also at "/"), our scripts, styles, locales, manifest and icons, and
+    ECharts; the worker is not part of its own shell."""
+    ours = [f"/{path.relative_to(STATIC).as_posix()}" for path in STATIC.rglob("*")
+            if path.is_file() and "vendor" not in path.relative_to(STATIC).parts and path != WORKER
+            and path.suffix in (".html", ".js", ".css", ".json", ".webmanifest", ".png")]
+    return sorted(["/", *ours, f"/{ECHARTS.relative_to(STATIC).as_posix()}"])
+
+
+def shell_version(files: list[str]) -> str:
+    digest = hashlib.sha256()
+    for name in files[1:]:
+        digest.update(name.encode() + b"\0" + committed_bytes(STATIC / name[1:]) + b"\0")
+    return digest.hexdigest()[:12]
+
+
+def js_function(path: Path, name: str) -> str:
+    """A top-level function of a module, from its declaration to the brace that closes it at the start of a line."""
+    (text,) = re.findall(rf"^(?:export )?(?:async )?function {name}\(.*?^\}}", path.read_text(encoding="utf-8"), re.S | re.M)
+    return text
+
+
+def test_the_worker_caches_the_whole_shell_under_a_version_of_its_contents():
+    worker = WORKER.read_text(encoding="utf-8")
+    (listed,) = re.findall(r"^const SHELL = \[(.*?)\];", worker, re.S | re.M)
+    assert sorted(re.findall(r'"([^"]+)"', listed)) == shell_files()
+    # Any change to the shell names a new cache, which replaces the old one on activation.
+    expected = shell_version(shell_files())
+    assert re.findall(r'^const VERSION = "(\w+)";', worker, re.M) == [expected], f"set VERSION in sw.js to {expected}"
+    assert "const SHELL_CACHE = `btlab-shell-${VERSION}`;" in worker
+    assert 'key.startsWith("btlab-shell-") && key !== SHELL_CACHE' in worker
+
+
+def test_the_worker_answers_only_get_requests_from_its_caches():
+    worker = WORKER.read_text(encoding="utf-8")
+    (handler,) = re.findall(r'^self\.addEventListener\("fetch", \(event\) => \{$(.*?)^\}\);', worker, re.S | re.M)
+    # Every other method returns before the worker can answer: the browser sends it to the network itself.
+    assert handler.index('if (request.method !== "GET") return;') < handler.index("respondWith")
+    assert worker.count("respondWith") == handler.count("respondWith") == 2
+    # Saved results answer only when btlab does not.
+    network_first = js_function(WORKER, "networkFirst")
+    assert network_first.index("await fetch(request)") < network_first.index("caches.match(request, {cacheName: RESULTS_CACHE})")
+
+
+def test_logging_out_deletes_the_results_cache():
+    """A static check: logout deletes the cache whether or not the server answers, and it is the cache the worker
+    falls back on."""
+    assert re.search(r"\} finally \{\s+await offline\.clear\(\);", js_function(STATIC / "app.js", "logout"))
+    assert 'import * as offline from "./lib/offline.js";' in (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "await caches.delete(RESULTS_CACHE);" in js_function(OFFLINE, "clear")
+    name = re.compile(r'^(?:export )?const RESULTS_CACHE = "([a-z-]+)";', re.M)
+    assert name.findall(OFFLINE.read_text(encoding="utf-8")) == name.findall(WORKER.read_text(encoding="utf-8")) == ["btlab-results"]
+
+
+def test_the_offline_strings_exist_in_both_locales():
+    for name in ("en", "zh-TW"):
+        table = locale(name)
+        assert [key for key in OFFLINE_STRINGS if not table.get(key, "").strip()] == []
+        assert "{time}" in table["shell.offline"] and "{count}" in table["settings.offline_count"]

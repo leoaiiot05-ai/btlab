@@ -82,13 +82,14 @@ html, body {
 .badge.mode-trade { border-color: var(--warn); color: var(--warn); }
 .badge.mode-live { background: var(--live-bg); border-color: var(--live-bg); color: var(--live-ink); }
 
+.banners { grid-area: banner; }
 .banner {
-  grid-area: banner;
   padding: 10px 12px;
   font-weight: 700;
   text-align: center;
 }
 .banner.live { background: var(--live-bg); color: var(--live-ink); }
+.banner.offline { background: var(--warn-bg); color: var(--warn); }
 
 main {
   grid-area: main;

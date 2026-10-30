@@ -1,8 +1,10 @@
-// The shell: login, navigation, the run-mode badge, polling, the language toggle and logout (SPEC.md §20.2, §20.4).
+// The shell: login, navigation, the run-mode badge, polling, the language toggle and logout (SPEC.md §20.2, §20.4),
+// and offline mode with the saved results (§20.5).
 
-import {UNAUTHORIZED, get, post} from "./lib/api.js";
+import {UNAUTHORIZED, get, post, setOffline} from "./lib/api.js";
 import {button, clear, h, select} from "./lib/dom.js";
-import {code, current, errorText, load, preferred, t} from "./lib/i18n.js";
+import {code, current, errorText, load, moment, preferred, t} from "./lib/i18n.js";
+import * as offline from "./lib/offline.js";
 import * as backtest from "./views/backtest.js";
 import * as compare from "./views/compare.js";
 import * as data from "./views/data.js";
@@ -17,11 +19,14 @@ const TABS = ["home", "data", "backtest", "results", "optimize", "live", "settin
 const VIEWS = {home, data, backtest, rules, results, compare, optimize, settings, live: later};
 // Views opened from a tab's view keep that tab lit.
 const PARENTS = {rules: "backtest", compare: "results"};
+// What still works offline: the stored results, and the settings.
+const OFFLINE_VIEWS = ["results", "settings"];
 const FAST_MS = 2000;
 const SLOW_MS = 15000;
 
 const context = {
   state: null,
+  offline: false,
   // A rule drafted in the rule builder, handed to the Backtest view (§20.2 item 4).
   draftRule: null,
   // The Backtest view's current form, which the Optimize view can start from (§20.2 item 6).
@@ -35,6 +40,8 @@ const context = {
   },
   logout: () => logout(),
   language: (name) => switchLanguage(name),
+  // Keeps the results cache equal to the server's offline set; refresh re-stores one result just seen online.
+  sync: (refresh = null) => (context.offline ? Promise.resolve() : offline.sync(refresh).catch(() => {})),
 };
 let timer = null;
 let lastEvent = 0;
@@ -43,12 +50,32 @@ async function boot() {
   await load(preferred());
   window.addEventListener(UNAUTHORIZED, showLogin);
   window.addEventListener("hashchange", () => render());
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
   try {
-    context.state = await get("/api/state");
-  } catch {
-    return showLogin();
+    seen(await get("/api/state"));
+  } catch (error) {
+    if (error.status === 401) return showLogin();
+    // No answer at all: the stored results only (§20.5).
+    setMode(true);
+    return showShell();
   }
   showShell();
+  context.sync();
+}
+
+function seen(state) {
+  context.state = state;
+  offline.remember(state.app.server_time);
+}
+
+function setMode(isOffline) {
+  context.offline = isOffline;
+  setOffline(isOffline);
+  document.body.classList.toggle("offline", isOffline);
+  const banner = document.getElementById("offline");
+  if (!banner) return;
+  banner.hidden = !isOffline;
+  banner.textContent = isOffline ? t("shell.offline", {time: moment(offline.lastSeen())}) : "";
 }
 
 function showLogin() {
@@ -60,8 +87,9 @@ function showLogin() {
     event.preventDefault();
     try {
       await post("/api/login", {token: token.value});
-      context.state = await get("/api/state");
+      seen(await get("/api/state"));
       showShell();
+      context.sync();
     } catch (error) {
       message.textContent = errorText(error);
     }
@@ -83,10 +111,13 @@ function showShell() {
       h("span", {class: "spacer"}),
       select([["zh-TW", "中文"], ["en", "English"]], current(), switchLanguage),
       button(t("shell.logout"), logout)),
-    h("div", {id: "banner", class: "banner live", hidden: true}),
+    h("div", {class: "banners"},
+      h("div", {id: "banner", class: "banner live", hidden: true}),
+      h("div", {id: "offline", class: "banner offline", role: "status", hidden: true})),
     h("nav", {class: "tabs", "aria-label": t("shell.views")},
       TABS.map((name) => h("a", {href: `#${name}`, id: `tab-${name}`, class: "tab", text: t(`view.${name}`)}))),
     h("main", {id: "view"}));
+  setMode(context.offline);
   showBadge();
   render();
   schedule();
@@ -107,6 +138,11 @@ function render() {
   const main = document.getElementById("view");
   if (!main) return;
   clear(main);
+  if (context.offline && !OFFLINE_VIEWS.includes(name)) {
+    main.append(h("h2", {text: t(`view.${PARENTS[name] || name}`)}), h("p", {class: "quiet", text: t("shell.needs_connection")}),
+      h("a", {href: "#results", text: t("shell.saved_results")}));
+    return;
+  }
   VIEWS[name].render(main, context);
 }
 
@@ -127,8 +163,14 @@ function showBadge() {
 async function poll() {
   clearTimeout(timer);
   try {
-    context.state = await get("/api/state");
+    seen(await get("/api/state"));
     showBadge();
+    if (context.offline) {
+      // Back online by itself: everything works again, and the cache catches up.
+      setMode(false);
+      render();
+      context.sync();
+    }
     const newest = context.state.events.length ? context.state.events[0].id : 0;
     const view = VIEWS[route()[0]];
     const main = document.getElementById("view");
@@ -137,18 +179,17 @@ async function poll() {
     lastEvent = newest;
   } catch (error) {
     if (error.status === 401) return;
-    const banner = document.getElementById("banner");
-    if (banner) {
-      banner.hidden = false;
-      banner.textContent = t("shell.unreachable");
+    if (!context.offline) {
+      setMode(true);
+      render();
     }
   }
   schedule();
 }
 
 function schedule() {
-  // Every 2 s while a job runs, otherwise every 15 s (§20.4).
-  const busy = context.state && Object.values(context.state.jobs).some(Boolean);
+  // Every 2 s while a job runs, otherwise every 15 s (§20.4); offline, every 15 s until btlab answers.
+  const busy = !context.offline && context.state && Object.values(context.state.jobs).some(Boolean);
   timer = setTimeout(poll, busy ? FAST_MS : SLOW_MS);
 }
 
@@ -158,10 +199,14 @@ async function switchLanguage(name) {
 }
 
 async function logout() {
+  // Logging out deletes the saved results (§20.5).
   try {
     await post("/api/logout");
+  } catch {
+    // Offline the server cannot be told; the saved results go anyway.
   } finally {
-    if ("caches" in window) await caches.delete("btlab-results");
+    await offline.clear();
+    setMode(false);
     showLogin();
   }
 }

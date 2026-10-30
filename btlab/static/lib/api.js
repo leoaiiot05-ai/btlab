@@ -12,13 +12,27 @@ export class ApiError extends Error {
 
 export const UNAUTHORIZED = "btlab:unauthorized";
 
+let offline = false;
+
+export function setOffline(value) {
+  // Offline, the app reads stored results only and writes nothing (§20.5).
+  offline = value;
+}
+
 export async function api(method, path, body) {
+  if (offline && method !== "GET") throw new ApiError(0, {error: "OFFLINE", message: ""});
   const options = {method, credentials: "same-origin", headers: {}};
   if (body !== undefined) {
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
   }
-  const response = await fetch(path, options);
+  let response;
+  try {
+    response = await fetch(path, options);
+  } catch {
+    // No answer at all, and nothing stored to answer for btlab.
+    throw new ApiError(0, {error: "OFFLINE", message: ""});
+  }
   if (response.status === 401 && path !== "/api/login") window.dispatchEvent(new Event(UNAUTHORIZED));
   const json = (response.headers.get("Content-Type") || "").startsWith("application/json");
   const content = json ? await response.json() : null;

@@ -151,7 +151,8 @@ def test_bodies_are_json_with_finite_numbers(world, method, path, data, content_
 def test_section_21_headers_on_api_answers_errors_and_static_files(world):
     async def scenario(client):
         found = {}
-        for name, path in (("api", "/api/state"), ("error", "/api/nothing"), ("static", "/"), ("missing", "/nothing.js")):
+        for name, path in (("api", "/api/state"), ("error", "/api/nothing"), ("static", "/"), ("worker", "/sw.js"),
+                           ("missing", "/nothing.js")):
             response = await client.get(path)
             found[name] = (response.status, response.headers)
         response = await client.post("/api/logout", json={})
@@ -161,11 +162,13 @@ def test_section_21_headers_on_api_answers_errors_and_static_files(world):
 
     found = serve(world, scenario)
     assert {name: status for name, (status, _) in found.items()} == {
-        "api": 200, "error": 404, "static": 200, "missing": 404, "logout": 204, "unauthorized": 401}
+        "api": 200, "error": 404, "static": 200, "worker": 200, "missing": 404, "logout": 204, "unauthorized": 401}
     for name, (_, headers) in found.items():
         assert headers["Content-Security-Policy"] == CSP
         assert headers["X-Content-Type-Options"] == "nosniff" and headers["Referrer-Policy"] == "no-referrer"
-        assert headers["Cache-Control"] == ("no-cache" if name in ("static", "missing") else "no-store"), name
+        assert headers["Cache-Control"] == ("no-cache" if name in ("static", "worker", "missing") else "no-store"), name
+    # A service worker served as anything but JavaScript is refused; no-cache finds a new one at once.
+    assert found["worker"][1]["Content-Type"].startswith("text/javascript")
 
 
 def test_the_server_listens_on_127_0_0_1_only(world):

@@ -18,7 +18,7 @@ from btlab.plugins import PluginFolder
 from btlab.prices import adjusted, day_events
 from btlab.records import DailyBars, MinuteCoverage, to_date, to_day
 from btlab.store import MinuteStore
-from btlab.web import Services, make_app
+from btlab.web import SYNC_HEADER, Services, make_app
 from builders import TAXES, WEEKDAYS, put_bars, synthetic_store
 from fakes import InlinePool
 from test_config import VALID, render
@@ -234,6 +234,19 @@ def test_the_offline_set_is_the_20_most_recently_opened_plus_kept_ones(world):
     opened, (status, found) = serve(world, scenario)
     assert opened[0] == "2026-10-28T01:00:10Z" and opened[-1] == "2026-10-28T01:03:40Z" and ids == [1, 2, 3]
     assert found == {"ids": [*range(22, 2, -1), 1, 25]}
+
+
+def test_the_offline_sync_reads_a_result_without_opening_it(world):
+    """The app stores a kept result with X-Btlab-Sync: 1; that is not opening it, so the offline set stays as it was."""
+    backtest_id = saved(world, CONFIG)
+
+    async def scenario(client):
+        synced = await answer(await client.get(f"/api/backtests/{backtest_id}", headers={SYNC_HEADER: "1"}))
+        return synced, await answer(await client.get("/api/offline"))
+
+    (status, detail), offline = serve(world, scenario)
+    assert status == 200 and detail["id"] == backtest_id and detail["opened_at"] is None
+    assert world.store.backtest(backtest_id).opened_at is None and offline == (200, {"ids": []})
 
 
 # ----- candles -----

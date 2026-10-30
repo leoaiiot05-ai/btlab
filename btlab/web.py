@@ -55,6 +55,7 @@ MINUTE_WINDOW_S = 40 * 86_400
 LIST_LIMIT, MAX_LIST_LIMIT = 100, 1_000
 TRADES_LIMIT, MAX_TRADES_LIMIT = 500, 5_000
 OFFLINE_RECENT = 20
+SYNC_HEADER = "X-Btlab-Sync"
 COMPARED = (2, 4)
 KEY_METRICS = ("total_return", "cagr", "sharpe", "max_drawdown", "trades")
 SERIES_SHOWN = ("EQUITY", "BENCHMARK", "CASH", "GROSS", "NET", "POSITIONS")
@@ -708,9 +709,13 @@ async def list_backtests(request: web.Request) -> web.Response:
 
 
 async def get_backtest(request: web.Request) -> web.Response:
-    """The detail; serving it sets opened_at, which chooses the results kept offline (§20.5)."""
+    """The detail; serving it sets opened_at, which chooses the results kept offline (§20.5). The app's offline sync
+    (X-Btlab-Sync: 1) caches a result without opening it."""
     services = _services(request)
-    row = services.store.open_backtest(_id(request), _now(services))
+    if request.headers.get(SYNC_HEADER) == "1":
+        row = services.store.backtest(_id(request))
+    else:
+        row = services.store.open_backtest(_id(request), _now(services))
     if row is None:
         raise ApiError(404, "NOT_FOUND", "no such backtest")
     return _json({
