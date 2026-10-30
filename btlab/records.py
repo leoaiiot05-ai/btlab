@@ -249,7 +249,8 @@ class Trade:
 
 @dataclass(frozen=True)
 class BacktestRow:
-    """A saved backtest without its series and trades (§18); config, data_stamp, metrics, tables and flags are JSON."""
+    """A saved backtest without its series and trades (§18); config, data_stamp, metrics, tables and flags are JSON.
+    Listings leave the tables out (None)."""
 
     id: int
     created_at: datetime
@@ -259,7 +260,7 @@ class BacktestRow:
     config: dict
     data_stamp: dict
     metrics: dict
-    tables: dict
+    tables: dict | None
     flags: dict
     keep_offline: bool
     opened_at: datetime | None

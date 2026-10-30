@@ -53,3 +53,9 @@ Covers SPEC.md §10.11, §12, §13, §19 and §20.5 (the server's part). Accepta
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-20 and AC-30 hold (IN_SAMPLE_SERIES arrives with prompt 20), with the API part of AC-22.** `.venv/bin/python -m pytest -q`: 1091 passed (also with `-X dev -W error`).
+- Built as planned. Backtest and optimization routes go through the real jobs in the tests, over the in-process pool, so a POST is followed to its saved result.
+- **For prompts 17 to 19:** the UI reads `time_unit` from every series and candle payload; the series payload adds DRAWDOWN; trades come as `{"time_unit", "total", "offset", "trades"}`; markers carry `side` BUY or SELL and `reason` ENTRY or the exit reason; compare answers `{"time_unit": "day", "t", "series": {id: values}, "runs"}`; promote takes `{"combo": [values]}`; NEEDS_CONFIRMATION carries `estimate_seconds`. The service worker caches, per id of `GET /api/offline`, `/api/backtests/{id}`, its `/series` and `/trades?limit=500`.

@@ -17,16 +17,25 @@ from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
+import numpy as np
+
+from btlab.backtest import TIMEFRAMES, RunConfigError, equity_csv, trades_csv
 from btlab.builtins import BUILTINS
+from btlab.calendar import session
 from btlab.config import Config
+from btlab.intraday import TIMEFRAME_MINUTES, resample
 from btlab.jobs import JobRunning
 from btlab.markets import MARKETS, category_by_rule, normalize_symbol
+from btlab.metrics import drawdown
 from btlab.notifier import Notifier, Silent
+from btlab.optimize import NeedsConfirmation, OptimizeError, combination_config, heatmap
 from btlab.plugins import PluginFolder
-from btlab.records import SymbolList, to_date
+from btlab.prices import adjusted, align, day_events
+from btlab.records import BacktestRow, MinuteBars, OptimizationRow, SymbolList, Trade, to_date, to_day
 from btlab.registry import operands
 from btlab.rules import validate_rule
 from btlab.scheduler import next_time
@@ -40,6 +49,15 @@ LOGIN_DELAY_S = 1.0
 EVENTS_SHOWN = 50
 LANES = ("DATA", "MINUTE", "COMPUTE", "LIVE")
 CANCELLABLE = ("DATA", "MINUTE", "COMPUTE")
+MAX_CANDLES = 5_000
+# A minute candle window without "from" starts this long before "to".
+MINUTE_WINDOW_S = 40 * 86_400
+LIST_LIMIT, MAX_LIST_LIMIT = 100, 1_000
+TRADES_LIMIT, MAX_TRADES_LIMIT = 500, 5_000
+OFFLINE_RECENT = 20
+COMPARED = (2, 4)
+KEY_METRICS = ("total_return", "cagr", "sharpe", "max_drawdown", "trades")
+SERIES_SHOWN = ("EQUITY", "BENCHMARK", "CASH", "GROSS", "NET", "POSITIONS")
 HEADERS = {
     "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
     "X-Content-Type-Options": "nosniff",
@@ -103,6 +121,25 @@ def make_app(services: Services) -> web.Application:
         web.put(r"/api/rules/{id:\d+}", update_rule),
         web.delete(r"/api/rules/{id:\d+}", delete_rule),
         web.post("/api/rules/validate", check_rule),
+        web.post("/api/backtests", start_backtest),
+        web.get("/api/backtests", list_backtests),
+        web.get(r"/api/backtests/{id:\d+}", get_backtest),
+        web.patch(r"/api/backtests/{id:\d+}", patch_backtest),
+        web.delete(r"/api/backtests/{id:\d+}", delete_backtest),
+        web.get(r"/api/backtests/{id:\d+}/series", get_series),
+        web.get(r"/api/backtests/{id:\d+}/trades", get_trades),
+        web.get(r"/api/backtests/{id:\d+}/candles/{symbol}", get_backtest_candles),
+        web.get(r"/api/backtests/{id:\d+}/export/trades.csv", export_trades),
+        web.get(r"/api/backtests/{id:\d+}/export/equity.csv", export_equity),
+        web.get("/api/offline", get_offline),
+        web.get("/api/compare", get_compare),
+        web.get("/api/candles/{market}/{symbol}", get_candles),
+        web.post("/api/optimizations", start_optimization),
+        web.get("/api/optimizations", list_optimizations),
+        web.get(r"/api/optimizations/{id:\d+}", get_optimization),
+        web.get(r"/api/optimizations/{id:\d+}/heatmap", get_heatmap),
+        web.post(r"/api/optimizations/{id:\d+}/promote", promote),
+        web.delete(r"/api/optimizations/{id:\d+}", delete_optimization),
         web.get("/{path:.*}", static),
     ])
     return app
@@ -564,6 +601,374 @@ async def delete_rule(request: web.Request) -> web.Response:
 async def check_rule(request: web.Request) -> web.Response:
     issues = validate_rule(_object(await read_json(request), ("rule",)).get("rule"))
     return _json({"ok": not issues, "errors": _issues(issues)})
+
+
+# ----- data payloads (§19) -----
+
+
+def _round(number: float) -> float | None:
+    """6 significant digits; NaN and infinities become null (§19)."""
+    return float(f"{number:.6g}") if math.isfinite(number) else None
+
+
+def _rounded(value: Any, keep: tuple[str, ...] = ()) -> Any:
+    """Every float of a data payload rounded; the entries named in keep (parameter values) stay as stored."""
+    if isinstance(value, float):
+        return _round(value)
+    if isinstance(value, dict):
+        return {key: item if key in keep else _rounded(item, keep) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_rounded(item, keep) for item in value]
+    return value
+
+
+def _column(values: np.ndarray) -> list[float | None]:
+    return [_round(value) for value in np.asarray(values, dtype=np.float64).tolist()]
+
+
+def _time_unit(timeframe: str) -> str:
+    return "day" if timeframe == "1d" else "second"
+
+
+def _query_integer(request: web.Request, key: str, default: int | None, low: int = 0, high: int | None = None) -> int | None:
+    text = request.query.get(key)
+    if text is None:
+        return default
+    try:
+        value = int(text)
+    except ValueError:
+        raise ApiError(400, "INVALID_FIELD", "must be a whole number", key) from None
+    if value < low or (high is not None and value > high):
+        raise ApiError(400, "INVALID_FIELD", f"must be from {low}" + (f" to {high}" if high is not None else " up"), key)
+    return value
+
+
+def _invalid(error: RunConfigError, prefix: str = "") -> ApiError:
+    """INVALID_FIELD at the first error's path, with every error listed."""
+    errors = [{"path": prefix + path if path else prefix.rstrip("."), "message": message} for path, message in error.errors]
+    return ApiError(400, "INVALID_FIELD", errors[0]["message"], errors[0]["path"], errors=errors)
+
+
+def _job(job: Any) -> dict:
+    return {"job": {"lane": job.lane, "kind": job.kind}}
+
+
+# ----- backtests (§10.11, §12, §20.5) -----
+
+
+def _backtest(store: Store, backtest_id: int) -> BacktestRow:
+    found = store.backtest(backtest_id)
+    if found is None:
+        raise ApiError(404, "NOT_FOUND", "no such backtest")
+    return found
+
+
+async def start_backtest(request: web.Request) -> web.Response:
+    """202 with the job; 400 INVALID_FIELD at the configuration's path; 409 JOB_RUNNING."""
+    config = _object(await read_json(request), ("config",)).get("config")
+    try:
+        job = _services(request).jobs.backtest(config)
+    except RunConfigError as error:
+        raise _invalid(error, "config.") from None
+    return _json(_job(job), 202)
+
+
+async def list_backtests(request: web.Request) -> web.Response:
+    """Newest first: what the results list shows of each."""
+    market = request.query.get("market")
+    if market is not None:
+        _market(market, "market")
+    limit = _query_integer(request, "limit", LIST_LIMIT, 1, MAX_LIST_LIMIT)
+    return _json([
+        {"id": row.id, "name": row.name, "created_at": _utc(row.created_at), "market": row.market,
+         "timeframe": row.timeframe,
+         "strategy": {"source": row.config["strategy"]["source"], "id": row.config["strategy"].get("id")},
+         "period": {"start": row.config["start"], "end": row.config["end"]},
+         "metrics": _rounded({key: row.metrics["strategy"].get(key) for key in KEY_METRICS}),
+         "flags": list(row.flags), "keep_offline": row.keep_offline}
+        for row in _services(request).store.backtests(market, limit)
+    ])
+
+
+async def get_backtest(request: web.Request) -> web.Response:
+    """The detail; serving it sets opened_at, which chooses the results kept offline (§20.5)."""
+    services = _services(request)
+    row = services.store.open_backtest(_id(request), _now(services))
+    if row is None:
+        raise ApiError(404, "NOT_FOUND", "no such backtest")
+    return _json({
+        "id": row.id, "name": row.name, "created_at": _utc(row.created_at), "market": row.market,
+        "timeframe": row.timeframe, "time_unit": _time_unit(row.timeframe), "config": row.config,
+        "data_stamp": row.data_stamp, "metrics": _rounded(row.metrics), "tables": _rounded(row.tables),
+        "flags": row.flags, "keep_offline": row.keep_offline, "opened_at": _utc(row.opened_at),
+    })
+
+
+async def patch_backtest(request: web.Request) -> web.Response:
+    body = _object(await read_json(request), ("name", "keep_offline"))
+    name = _text(body, "name") if "name" in body else None
+    keep = body.get("keep_offline")
+    if "keep_offline" in body and not isinstance(keep, bool):
+        raise ApiError(400, "INVALID_FIELD", "must be true or false", "keep_offline")
+    if not _services(request).store.update_backtest(_id(request), name, keep):
+        raise ApiError(404, "NOT_FOUND", "no such backtest")
+    return web.Response(status=204)
+
+
+async def delete_backtest(request: web.Request) -> web.Response:
+    """409 IN_USE while an active live portfolio follows the result."""
+    store = _services(request).store
+    row = _backtest(store, _id(request))
+    if store.backtest_in_use(row.id):
+        raise ApiError(409, "IN_USE", "a live portfolio follows this backtest")
+    store.delete_backtest(row.id)
+    return web.Response(status=204)
+
+
+async def get_series(request: web.Request) -> web.Response:
+    """The series payload: the stored series of §18, and the drawdown of the equity."""
+    store = _services(request).store
+    row = _backtest(store, _id(request))
+    series = store.backtest_series(row.id)
+    shown = {kind: _column(series[kind]) for kind in SERIES_SHOWN if kind in series}
+    shown["DRAWDOWN"] = _column(drawdown(series["EQUITY"]))
+    return _json({"time_unit": _time_unit(row.timeframe), "t": series["TIME"].astype(np.int64).tolist(), "series": shown})
+
+
+async def get_trades(request: web.Request) -> web.Response:
+    store = _services(request).store
+    row = _backtest(store, _id(request))
+    offset = _query_integer(request, "offset", 0)
+    limit = _query_integer(request, "limit", TRADES_LIMIT, 1, MAX_TRADES_LIMIT)
+    return _json({"time_unit": _time_unit(row.timeframe), "total": store.backtest_trade_count(row.id), "offset": offset,
+                  "trades": [_rounded(asdict(trade)) for trade in store.backtest_trades(row.id, offset, limit)]})
+
+
+async def get_backtest_candles(request: web.Request) -> web.Response:
+    """The run's symbol on the run's timeframe, on the prices its fills used (raw in REALISTIC mode), with the
+    trades' entries and exits as markers."""
+    services = _services(request)
+    row = _backtest(services.store, _id(request))
+    symbol = request.match_info["symbol"]
+    if symbol not in row.config["symbols"]:
+        raise ApiError(404, "NOT_FOUND", "the backtest has no such symbol")
+    found = _candles(services, row.market, symbol, row.timeframe, row.config["price_mode"] == "ADJUSTED",
+                     *_window(request, row.timeframe, services))
+    trades = [trade for trade in services.store.backtest_trades(row.id) if trade.symbol == symbol]
+    return _json(found | {"markers": _markers(trades, found["t"])})
+
+
+def _markers(trades: list[Trade], times: list[int]) -> list[dict]:
+    """Entries, and exits other than OPEN, inside the candles' window."""
+    if not times:
+        return []
+    found = []
+    for trade in trades:
+        opening, closing = ("BUY", "SELL") if trade.side == "LONG" else ("SELL", "BUY")
+        moments = [(trade.entry_time, opening, trade.entry_price, "ENTRY")]
+        if trade.exit_reason != "OPEN":
+            moments.append((trade.exit_time, closing, trade.exit_price, trade.exit_reason))
+        found += [{"t": moment, "side": side, "price": _round(price), "quantity": _round(trade.quantity), "reason": reason}
+                  for moment, side, price, reason in moments if times[0] <= moment <= times[-1]]
+    return sorted(found, key=lambda marker: marker["t"])
+
+
+async def export_trades(request: web.Request) -> web.Response:
+    store = _services(request).store
+    row = _backtest(store, _id(request))
+    body = trades_csv(tuple(store.backtest_trades(row.id)), row.market, _time_unit(row.timeframe))
+    return _csv(body, f"backtest-{row.id}-trades.csv")
+
+
+async def export_equity(request: web.Request) -> web.Response:
+    store = _services(request).store
+    row = _backtest(store, _id(request))
+    return _csv(equity_csv(store.backtest_series(row.id), row.market, _time_unit(row.timeframe)), f"backtest-{row.id}-equity.csv")
+
+
+def _csv(body: bytes, name: str) -> web.Response:
+    return web.Response(body=body, content_type="text/csv", charset="utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+async def get_offline(request: web.Request) -> web.Response:
+    """The results the offline cache holds: the 20 most recently opened plus every keep-offline one (§20.5)."""
+    return _json({"ids": _services(request).store.offline_backtest_ids(OFFLINE_RECENT)})
+
+
+async def get_compare(request: web.Request) -> web.Response:
+    """2 to 4 results: each curve divided by its first value, aligned on the union of their days (a minute run's
+    session ends fall on their days), null where a run has no point; and their metrics side by side."""
+    store = _services(request).store
+    text = request.query.get("ids", "")
+    try:
+        ids = list(dict.fromkeys(int(part) for part in text.split(",")))
+    except ValueError:
+        raise ApiError(400, "INVALID_FIELD", "must be ids separated by commas", "ids") from None
+    if not COMPARED[0] <= len(ids) <= COMPARED[1]:
+        raise ApiError(400, "INVALID_FIELD", f"must name {COMPARED[0]} to {COMPARED[1]} backtests", "ids")
+    rows = [_backtest(store, backtest_id) for backtest_id in ids]
+    curves = [_curve_by_day(row, store.backtest_series(row.id)) for row in rows]
+    days = np.unique(np.concatenate([found for found, _ in curves]))
+    series = {}
+    for row, (found, values) in zip(rows, curves):
+        aligned = np.full(len(days), np.nan)
+        aligned[np.searchsorted(days, found)] = values
+        series[str(row.id)] = _column(aligned)
+    return _json({
+        "time_unit": "day", "t": days.tolist(), "series": series,
+        "runs": [{"id": row.id, "name": row.name, "market": row.market, "timeframe": row.timeframe,
+                  "metrics": _rounded(row.metrics["strategy"])} for row in rows],
+    })
+
+
+def _curve_by_day(row: BacktestRow, series: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    equity = series["EQUITY"]
+    times = series["TIME"].astype(np.int64)
+    if row.timeframe != "1d":
+        zone = ZoneInfo(MARKETS[row.market].time_zone)
+        times = np.array([to_day(datetime.fromtimestamp(int(t), zone).date()) for t in times], dtype=np.int64)
+    first = equity[np.isfinite(equity)][0]
+    return times, equity / first
+
+
+# ----- candles (§19) -----
+
+
+def _window(request: web.Request, timeframe: str, services: Services) -> tuple[int, int]:
+    """from and to in the payload's time unit; a minute window without from starts 40 days before to (now by
+    default)."""
+    last = _query_integer(request, "to", None)
+    first = _query_integer(request, "from", None)
+    if timeframe == "1d":
+        return (0 if first is None else first), (np.iinfo(np.int32).max if last is None else last)
+    last = int(services.clock()) if last is None else last
+    return (last - MINUTE_WINDOW_S if first is None else first), last
+
+
+async def get_candles(request: web.Request) -> web.Response:
+    """A stored symbol's candles: daily, or minute bars resampled to the timeframe; adjusted unless told otherwise."""
+    services = _services(request)
+    market, symbol = _known_symbol(request)
+    timeframe = request.query.get("tf", "1d")
+    if timeframe not in TIMEFRAMES:
+        raise ApiError(400, "INVALID_FIELD", "must be one of " + ", ".join(TIMEFRAMES), "tf")
+    choice = request.query.get("adjusted", "true")
+    if choice not in ("true", "false"):
+        raise ApiError(400, "INVALID_FIELD", "must be true or false", "adjusted")
+    found = _candles(services, market, symbol, timeframe, choice == "true", *_window(request, timeframe, services))
+    return _json(found | {"markers": []})
+
+
+def _candles(services: Services, market: str, symbol: str, timeframe: str, adjust: bool, first: int, last: int) -> dict:
+    """The candle payload without markers: at most 5,000 bars, the last ones of [first, last]."""
+    store = services.store
+    daily = store.daily_bars(market, symbol)
+    actions = store.actions(market, symbol)
+    if timeframe == "1d":
+        bars = adjusted(daily, day_events(market, daily, actions)[0]) if adjust else daily
+        t, columns = bars.day, [bars.open, bars.high, bars.low, bars.close, bars.volume]
+    else:
+        t, columns = _minute_candles(services.minute_store, market, symbol, timeframe, daily, actions, adjust, first, last)
+    inside = np.flatnonzero((t >= first) & (t <= last))[-MAX_CANDLES:]
+    names = ("open", "high", "low", "close", "volume")
+    return {"time_unit": _time_unit(timeframe), "t": t[inside].astype(np.int64).tolist(),
+            **{name: _column(values[inside]) for name, values in zip(names, columns)}}
+
+
+def _minute_candles(minute_store: MinuteStore, market: str, symbol: str, timeframe: str, daily: Any, actions: list,
+                    adjust: bool, first: int, last: int) -> tuple[np.ndarray, list[np.ndarray]]:
+    """1-minute bars resampled per session (§11.1); adjusted by their day's scale, as on minute timelines (§11.2)."""
+    bars = minute_store.minute_bars(market, symbol, first, last)
+    zone = ZoneInfo(MARKETS[market].time_zone)
+    days = np.array([to_day(datetime.fromtimestamp(int(t), zone).date()) for t in bars.t], dtype=np.int64)
+    opens = {day: session(market, day)[0] for day in np.unique(days).tolist()}
+    bars = resample(bars, np.array([opens[day] for day in days.tolist()], dtype=np.int64), TIMEFRAME_MINUTES[timeframe])
+    prices = [bars.open, bars.high, bars.low, bars.close]
+    if not adjust or not len(bars.t):
+        return bars.t, [*prices, bars.volume]
+    aligned, _ = align(market, daily.day, {symbol: (daily, actions)})
+    row = np.searchsorted(aligned.days, [to_day(datetime.fromtimestamp(int(t), zone).date()) for t in bars.t])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        volume_scale = aligned.adj_volume[:, 0] / aligned.volume[:, 0]
+    volume_scale = np.where(np.isfinite(volume_scale) & (volume_scale > 0), volume_scale, 1.0)
+    scale = aligned.multiplier[np.minimum(row, len(aligned.days) - 1), 0]
+    return bars.t, [*(price * scale for price in prices), bars.volume * volume_scale[np.minimum(row, len(aligned.days) - 1)]]
+
+
+# ----- optimizations (§13) -----
+
+
+def _optimization(store: Store, optimization_id: int) -> OptimizationRow:
+    found = store.optimization(optimization_id)
+    if found is None:
+        raise ApiError(404, "NOT_FOUND", "no such optimization")
+    return found
+
+
+def _optimization_summary(row: OptimizationRow) -> dict:
+    return {"id": row.id, "created_at": _utc(row.created_at), "name": row.name, "market": row.market, "mode": row.mode,
+            "status": row.status, "best": _rounded(row.best, ("values",)), "flags": row.flags}
+
+
+async def start_optimization(request: web.Request) -> web.Response:
+    """400 INVALID_FIELD or TOO_MANY_COMBOS before any job; once the job has its estimate, 409 NEEDS_CONFIRMATION
+    when it exceeds 10 minutes without confirm_long (§13.6), else 202."""
+    body = await read_json(request)
+    try:
+        job = _services(request).jobs.optimization(body)
+    except RunConfigError as error:
+        raise _invalid(error) from None
+    except OptimizeError as error:
+        raise ApiError(400, error.code, str(error)) from None
+    ready = await job.ready
+    if isinstance(ready, NeedsConfirmation):
+        raise ApiError(409, "NEEDS_CONFIRMATION", "the optimization needs more than 10 minutes; confirm it",
+                       estimate_seconds=_round(ready.estimate_seconds))
+    return _json(_job(job), 202)
+
+
+async def list_optimizations(request: web.Request) -> web.Response:
+    return _json([_optimization_summary(row) for row in _services(request).store.optimizations()])
+
+
+async def get_optimization(request: web.Request) -> web.Response:
+    row = _optimization(_services(request).store, _id(request))
+    return _json(_optimization_summary(row) | {"config": row.config, "results": _rounded(row.results, ("values", "paths"))})
+
+
+async def get_heatmap(request: web.Request) -> web.Response:
+    """§13.3; 400 INVALID_FIELD when x and y are not two of the optimization's paths."""
+    row = _optimization(_services(request).store, _id(request))
+    try:
+        found = heatmap(row.config, row.results, request.query.get("x"), request.query.get("y"))
+    except ValueError as error:
+        raise ApiError(400, "INVALID_FIELD", str(error), "x") from None
+    return _json(_rounded(found, ("values",)))
+
+
+async def promote(request: web.Request) -> web.Response:
+    """A combination, given as its values, runs as an ordinary backtest (§13.7)."""
+    services = _services(request)
+    row = _optimization(services.store, _id(request))
+    paths = list(row.config["ranges"])
+    combo = _object(await read_json(request), ("combo",)).get("combo")
+    if not isinstance(combo, list) or len(combo) != len(paths):
+        raise ApiError(400, "INVALID_FIELD", f"must list {len(paths)} values, one per range", "combo")
+    config = combination_config(row.config["config"], paths, combo)
+    config["name"] = f"{config['name']} ({', '.join(f'{path} {value}' for path, value in zip(paths, combo))})"
+    try:
+        job = services.jobs.backtest(config)
+    except RunConfigError as error:
+        path, message = error.errors[0]
+        raise ApiError(400, "INVALID_FIELD", f"{path}: {message}", "combo") from None
+    return _json(_job(job), 202)
+
+
+async def delete_optimization(request: web.Request) -> web.Response:
+    if not _services(request).store.delete_optimization(_id(request)):
+        raise ApiError(404, "NOT_FOUND", "no such optimization")
+    return web.Response(status=204)
 
 
 # ----- static files (§20) -----

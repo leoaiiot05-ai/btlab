@@ -114,7 +114,7 @@ def api_routes(world) -> list[tuple[str, str]]:
 
 def test_every_api_route_but_login_needs_the_session(world):
     routes = api_routes(world)
-    assert len(routes) == 19
+    assert len(routes) == 38
 
     async def scenario(client):
         return [await answer(await client.request(method, path, json={})) for method, path in routes]

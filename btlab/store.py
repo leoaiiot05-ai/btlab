@@ -735,19 +735,53 @@ class Store(_Database):
         return backtest_id
 
     def backtest(self, backtest_id: int) -> BacktestRow | None:
+        rows = self._read(f"SELECT {_BACKTEST_COLUMNS} FROM backtests WHERE id = ?", (backtest_id,))
+        return _backtest(*rows[0]) if rows else None
+
+    def backtests(self, market: str | None = None, limit: int | None = None) -> list[BacktestRow]:
+        """Newest first, without their tables."""
         rows = self._read(
-            "SELECT id, created_at, name, market, timeframe, config, data_stamp, metrics, tables, flags, keep_offline,"
-            " opened_at FROM backtests WHERE id = ?",
-            (backtest_id,),
+            f"SELECT {_BACKTEST_COLUMNS.replace('tables', 'NULL')} FROM backtests WHERE ?1 IS NULL OR market = ?1"
+            " ORDER BY id DESC LIMIT ?2",
+            (market, -1 if limit is None else limit),
         )
-        if not rows:
-            return None
-        id_, created_at, name, market, timeframe, *documents, keep_offline, opened_at = rows[0]
-        config, data_stamp, metrics, tables, flags = (json.loads(document) for document in documents)
-        return BacktestRow(
-            id_, _moment(created_at), name, market, timeframe, config, data_stamp, metrics, tables, flags,
-            bool(keep_offline), _moment(opened_at),
-        )
+        return [_backtest(*row) for row in rows]
+
+    def open_backtest(self, backtest_id: int, at: datetime) -> BacktestRow | None:
+        """A result as its detail is served: opened_at, which drives the offline set (§20.5), becomes at."""
+        with self._write() as db:
+            db.execute("UPDATE backtests SET opened_at = ? WHERE id = ?", (_iso(at), backtest_id))
+        return self.backtest(backtest_id)
+
+    def update_backtest(self, backtest_id: int, name: str | None = None, keep_offline: bool | None = None) -> bool:
+        """False for an unknown result; None leaves a field as it is."""
+        with self._write() as db:
+            cursor = db.execute(
+                "UPDATE backtests SET name = COALESCE(?, name), keep_offline = COALESCE(?, keep_offline) WHERE id = ?",
+                (name, None if keep_offline is None else int(keep_offline), backtest_id),
+            )
+        return cursor.rowcount == 1
+
+    def delete_backtest(self, backtest_id: int) -> bool:
+        """Its series and trades go with it (ON DELETE CASCADE)."""
+        with self._write() as db:
+            cursor = db.execute("DELETE FROM backtests WHERE id = ?", (backtest_id,))
+        return cursor.rowcount == 1
+
+    def backtest_in_use(self, backtest_id: int) -> bool:
+        """Whether an active live portfolio follows the result (§19: IN_USE)."""
+        return bool(self._read("SELECT 1 FROM live_portfolios WHERE backtest_id = ? AND active = 1", (backtest_id,)))
+
+    def offline_backtest_ids(self, recent: int) -> list[int]:
+        """The recent most recently opened results, then every other one kept offline (§20.5)."""
+        opened = [id_ for (id_,) in self._read(
+            "SELECT id FROM backtests WHERE opened_at IS NOT NULL ORDER BY opened_at DESC, id DESC LIMIT ?", (recent,))]
+        kept = [id_ for (id_,) in self._read("SELECT id FROM backtests WHERE keep_offline = 1 ORDER BY id")]
+        return opened + [id_ for id_ in kept if id_ not in opened]
+
+    def backtest_trade_count(self, backtest_id: int) -> int:
+        ((count,),) = self._read("SELECT COUNT(*) FROM trades WHERE backtest_id = ?", (backtest_id,))
+        return count
 
     def backtest_series(self, backtest_id: int) -> dict[str, np.ndarray]:
         rows = self._read("SELECT kind, values_blob FROM backtest_series WHERE backtest_id = ?", (backtest_id,))
@@ -995,6 +1029,20 @@ def _array(blob: bytes) -> np.ndarray:
 def _json(value: Any) -> str:
     """Settings values; NaN and infinities are refused, because JSON has no such numbers."""
     return json.dumps(value, allow_nan=False)
+
+
+_BACKTEST_COLUMNS = (
+    "id, created_at, name, market, timeframe, config, data_stamp, metrics, tables, flags, keep_offline, opened_at"
+)
+
+
+def _backtest(id_: int, created_at: str, name: str, market: str, timeframe: str, config: str, data_stamp: str,
+              metrics: str, tables: str | None, flags: str, keep_offline: int, opened_at: str | None) -> BacktestRow:
+    return BacktestRow(
+        id_, _moment(created_at), name, market, timeframe, json.loads(config), json.loads(data_stamp),
+        json.loads(metrics), None if tables is None else json.loads(tables), json.loads(flags), bool(keep_offline),
+        _moment(opened_at),
+    )
 
 
 _OPTIMIZATION_COLUMNS = "id, created_at, name, market, mode, status, config, best, flags"
