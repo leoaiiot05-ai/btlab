@@ -1,76 +1,16 @@
 """The engine core on hand-made bars (SPEC.md §9.1, §9.4, §10.3 to §10.7, AC-5, AC-7, AC-8, AC-9)."""
 
 from datetime import date
-from pathlib import Path
 
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose, assert_array_equal
 
-from btlab.costs import CostModel
-from btlab.engine import Book, Settings, Targets, Timeline, simulate
-from btlab.markets import TW, US, PerShareCommission, RateCommission
+from btlab.engine import Timeline, simulate
+from btlab.markets import TW, US
 from btlab.records import ShortSuspension, to_day
 from btlab.sizing import Sizing
-from btlab.taxes import load_taxes
-
-TAXES = load_taxes(Path(__file__).resolve().parents[1] / "taxes.toml")
-DAY0 = to_day(date(2020, 6, 1))  # a Monday
-FREE_US = PerShareCommission(per_share=0.0, min=0.0, max_pct=1.0)
-FREE_TW = RateCommission(rate_pct=0.0, min=0.0)
-
-
-def bars(closes, opens=None, highs=None, lows=None, *, days=None, sessions=None, tradable=None, lock=None, cash=None,
-         ratio=None, adjust=None, start=0, symbols=None) -> Timeline:
-    """A timeline from bars × symbols rows; each bar is its own session on consecutive days unless told otherwise."""
-    close = np.array(closes, dtype=np.float64)
-    count, width = close.shape
-    open_ = close.copy() if opens is None else np.array(opens, dtype=np.float64)
-    high = np.fmax(open_, close) if highs is None else np.array(highs, dtype=np.float64)
-    low = np.fmin(open_, close) if lows is None else np.array(lows, dtype=np.float64)
-    adjust = np.ones_like(close) if adjust is None else np.array(adjust, dtype=np.float64)
-    days = np.arange(DAY0, DAY0 + count) if days is None else np.array(days)
-    session = np.arange(count) if sessions is None else np.array(sessions)
-    return Timeline(
-        symbols=symbols or tuple("ABCD"[:width]), time=days.copy(), day=days, session=session,
-        open=open_, high=high, low=low, close=close,
-        adj_open=open_ * adjust, adj_high=high * adjust, adj_low=low * adjust, adj_close=close * adjust,
-        tradable=np.isfinite(close) if tradable is None else np.array(tradable, dtype=bool),
-        lock=np.zeros(close.shape, dtype=np.int8) if lock is None else np.array(lock, dtype=np.int8),
-        cash=np.zeros_like(close) if cash is None else np.array(cash, dtype=np.float64),
-        ratio=np.ones_like(close) if ratio is None else np.array(ratio, dtype=np.float64), start=start,
-    )
-
-
-def us_costs(width=1, commission=FREE_US, slippage=0.0, withholding=0.0, borrow=0.5) -> CostModel:
-    return CostModel("US", commission, slippage, withholding, ("STOCK",) * width, borrow_fee_pct=(borrow,) * width)
-
-
-def tw_costs(categories=("STOCK",), commission=FREE_TW, short_fee=0.08, taxes=TAXES) -> CostModel:
-    return CostModel("TW", commission, 0.0, 0.0, tuple(categories), taxes, short_fee_pct=short_fee)
-
-
-def settings(costs=None, market="US", capital=10_000.0, **options) -> Settings:
-    return Settings(market, capital, costs or us_costs(), **options)
-
-
-def direction(*rows) -> Targets:
-    return Targets("DIRECTION", np.array(rows, dtype=np.float64))
-
-
-def weights(*rows, rebalance=None) -> Targets:
-    return Targets("WEIGHTS", np.array(rows, dtype=np.float64), None if rebalance is None else np.array(rebalance, dtype=bool))
-
-
-class Script:
-    """An ORDERS strategy: at bar t it calls the Book methods listed for t."""
-
-    def __init__(self, plan: dict[int, list[tuple[str, int, float]]]) -> None:
-        self.plan = plan
-
-    def on_bar(self, book: Book) -> None:
-        for method, j, value in self.plan.get(book.t, []):
-            getattr(book, method)(j, value)
+from builders import DAY0, Script, bars, direction, settings, tw_costs, us_costs, weights
 
 
 def assert_identity(timeline: Timeline, result, adjusted: bool = False) -> None:
@@ -234,9 +174,9 @@ def test_a_reversal_closes_one_trade_and_opens_another():
 def test_shorts_need_allow_short():
     timeline = bars([[10.0]] * 3)
     result = simulate(timeline, direction([-1], [-1], [-1]), settings(fill_timing="SAME_CLOSE"))
-    assert result.fills == () and result.flags == {"SHORTS_IGNORED"}
+    assert result.fills == () and result.flags == {"SHORTS_IGNORED": None}
     result = simulate(timeline, direction([-1], [-1], [-1]), settings(fill_timing="SAME_CLOSE", allow_short=True))
-    assert result.quantity[0, 0] == -1_000 and result.flags == frozenset()
+    assert result.quantity[0, 0] == -1_000 and result.flags == {}
     assert result.cash[0] == pytest.approx(20_000.0)  # the proceeds sit in cash
 
 
@@ -430,13 +370,13 @@ def test_the_book_places_every_kind_of_order_and_the_last_one_wins():
     result = simulate(timeline, script, settings(us_costs(2), fill_timing="SAME_CLOSE"))
     assert_array_equal(result.quantity[:, 0], [120, 100, 100, 100])
     assert_array_equal(result.quantity[:, 1], [50, 125, 0, 0])  # a short without allow_short counts as 0
-    assert result.flags == {"SHORTS_IGNORED"}
+    assert result.flags == {"SHORTS_IGNORED": None}
 
 
 def test_a_position_whose_data_end_stays_at_its_last_close():
     timeline = bars([[10.0], [10.0], [11.0], [np.nan], [np.nan]])
     result = simulate(timeline, direction([1], [1], [1], [1], [0]), settings(capital=1_000.0, fill_timing="SAME_CLOSE"))
-    assert result.flags == {"DATA_ENDED"}
+    assert result.flags == {"DATA_ENDED": None}
     assert_allclose(result.equity[2:], [1_100.0] * 3)
     (trade,) = result.trades
     assert (trade.exit_reason, trade.exit_price) == ("OPEN", 11.0)

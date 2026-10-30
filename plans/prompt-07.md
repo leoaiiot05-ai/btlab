@@ -58,3 +58,11 @@ Covers SPEC.md §5.4 (minute coverage), §10.7 (levels under share events) and �
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-10 holds.** `.venv/bin/python -m pytest -q`: 677 passed (also with `-X dev -W error`). The vectors L1 to L10 and S1 to S5 pass through `ibguard_step` and, as gap points, through `walk`.
+- The engine's open-trade class is now public (`OpenTrade`), since exits.py reads and sets its levels.
+- The engine-test builders moved to `tests/builders.py` for reuse.
+- Timing at bench size (50 symbols × 7,800 bars, MA cross with the ibguard exit, synthetic splits and dividends): 1.4 s on this VM (§24.3 case 1 allows 5 s on the owner's PC, metrics and loading not included yet).
+- **For prompts 8 and 11:** build `Overlays(ExitRules(...), minutes)` per run, from the run's `exits` (percentages as given) and `intrabar_path`: `minutes=None` for DAILY, `DailyMinutePaths(sessions)` for MINUTE on the daily timeline (SessionBars with multiplier 1 in REALISTIC, `Aligned.multiplier` in ADJUSTED). PATH_FALLBACK arrives in `EngineResult.flags` with its count.

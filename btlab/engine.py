@@ -78,7 +78,8 @@ class OrderStrategy(Protocol):
 
 
 class Exits(Protocol):
-    """Exit overlays (§10.8, prompt 7): intrabar is step 3 of each bar; at_close turns due max-hold exits into orders."""
+    """Exit overlays (§10.8): intrabar is step 3 of each bar; at_close turns due max-hold exits into orders, after the
+    strategy's evaluation, so that they replace its orders for those symbols."""
 
     def intrabar(self, simulation: "Simulation", t: int) -> None: ...
 
@@ -133,7 +134,8 @@ class Fill:
 @dataclass(frozen=True, eq=False)
 class EngineResult:
     """The run from bar `start` on (§10.11, without metrics). quantity holds the positions after each bar's close;
-    holdings and pending are the final positions and pending targets (symbol index → quantity)."""
+    holdings and pending are the final positions and pending targets (symbol index → quantity). flags maps each flag
+    raised to its detail, None or PATH_FALLBACK's count."""
 
     time: np.ndarray
     equity: np.ndarray
@@ -146,7 +148,7 @@ class EngineResult:
     quantity: np.ndarray
     trades: tuple[Trade, ...]
     fills: tuple[Fill, ...]
-    flags: frozenset[str]
+    flags: dict[str, int | None]
     holdings: np.ndarray
     pending: dict[int, float]
 
@@ -160,14 +162,18 @@ def simulate(timeline: Timeline, strategy: "Targets | OrderStrategy", settings: 
 class _Order:
     target: float
     reason: str = "SIGNAL"
+    signal_bar: int = 0
 
 
 @dataclass
-class _OpenTrade:
-    """Average-cost bookkeeping of one open trade; side is +1 (long) or −1 (short)."""
+class OpenTrade:
+    """Average-cost bookkeeping of one open trade; side is +1 (long) or −1 (short). The exit levels (§10.8) are set
+    by the overlays: the trailing extreme (peak or trough), ibguard's ref and prev, and the ATR stop's distance."""
 
     side: int
     entry_time: int
+    entry_bar: int = 0
+    signal_bar: int = 0
     entered: float = 0.0
     entered_value: float = 0.0
     average: float = 0.0
@@ -176,6 +182,10 @@ class _OpenTrade:
     exited_value: float = 0.0
     costs: float = 0.0
     dividends: float = 0.0
+    extreme: float | None = None
+    ref: float | None = None
+    prev: float | None = None
+    atr_distance: float | None = None
 
     def add(self, quantity: float, price: float, costs: float, held: float) -> None:
         self.average = (self.average * held + price * quantity) / (held + quantity)
@@ -190,10 +200,14 @@ class _OpenTrade:
         self.costs += costs
 
     def scale(self, ratio: float) -> None:
-        """A share event: r new shares per old share."""
+        """A share event: r new shares per old share; every price level is divided by r (§10.7)."""
         self.average /= ratio
         self.entered *= ratio
         self.exited *= ratio
+        for name in ("extreme", "ref", "prev", "atr_distance"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, value / ratio)
 
     def close(self, symbol: str, exit_time: int, reason: str, exit_price: float | None = None, unrealized: float = 0.0) -> Trade:
         """exit_price defaults to the average price of the exits."""
@@ -249,7 +263,8 @@ class Book:
 
 
 class Simulation:
-    """The state of one run. Exit overlays (prompt 7) act on it through the Exits hook."""
+    """The state of one run. Exit overlays act on it through the Exits hook: they read the prices of the run's price
+    mode, the positions and open trades, and call exit_position and order."""
 
     def __init__(self, timeline: Timeline, strategy: "Targets | OrderStrategy", settings: Settings, exits: Exits | None) -> None:
         if settings.price_mode not in PRICE_MODES or settings.fill_timing not in FILL_TIMINGS:
@@ -261,7 +276,10 @@ class Simulation:
         self.margin = market.short_collateral
         self.realistic = settings.price_mode == "REALISTIC"
         self.open = timeline.open if self.realistic else timeline.adj_open
+        self.high = timeline.high if self.realistic else timeline.adj_high
+        self.low = timeline.low if self.realistic else timeline.adj_low
         self.close = timeline.close if self.realistic else timeline.adj_close
+        self.t = timeline.start
         count = len(timeline.symbols)
         self.cash = float(settings.initial_capital)
         self.equity = self.cash
@@ -269,10 +287,10 @@ class Simulation:
         self.price = self._prices_before_start()
         self.pending: dict[int, _Order] = {}
         self.forced: set[int] = set()
-        self.open_trades: dict[int, _OpenTrade] = {}
+        self.open_trades: dict[int, OpenTrade] = {}
         self.trades: list[Trade] = []
         self.fills: list[Fill] = []
-        self.flags: set[str] = set()
+        self.flags: dict[str, int | None] = {}
         self.instructed = np.zeros(count)
         self.executed = np.full(count, np.nan)
         self.bought, self.shorted, self.shorted_value = np.zeros(count), np.zeros(count), np.zeros(count)
@@ -287,6 +305,7 @@ class Simulation:
     def run(self) -> EngineResult:
         timeline = self.timeline
         for t in range(timeline.start, len(timeline.time)):
+            self.t = t
             if t == timeline.start or timeline.session[t] != timeline.session[t - 1]:
                 self._start_session(t)
             self._fill_at_open(t)
@@ -314,18 +333,19 @@ class Simulation:
     def _fill_at_open(self, t: int) -> None:
         """Step 2: forced covers always fill at the open; pending orders too under NEXT_OPEN."""
         if self.forced:
-            covers = {j: _Order(0.0, "FORCED_COVER") for j in sorted(self.forced)}
+            covers = {j: _Order(0.0, "FORCED_COVER", t) for j in sorted(self.forced)}
             self.fill(t, self.open[t], covers)
             self.forced = {j for j in self.forced if self.q[j] < 0}
         if self.settings.fill_timing == "NEXT_OPEN" and self.pending:
             self.fill(t, self.open[t], self.pending)
 
     def _close(self, t: int) -> None:
-        """Step 4: value and record equity, due max-hold exits, the strategy's orders, and SAME_CLOSE fills."""
+        """Step 4: value and record equity, the strategy's orders and the due max-hold exits, which replace the
+        strategy's orders for their symbols, then SAME_CLOSE fills."""
         self._value(t)
+        self._evaluate(t)
         if self.exits is not None:
             self.exits.at_close(self, t)
-        self._evaluate(t)
         if self.settings.fill_timing == "SAME_CLOSE" and self.pending:
             self.fill(t, self.close[t], self.pending)
             self._value(t)
@@ -394,7 +414,7 @@ class Simulation:
         """Negative targets count as 0 without allow_short, and the result says so (§9.1)."""
         if self.settings.allow_short or not (values < 0).any():
             return values
-        self.flags.add("SHORTS_IGNORED")
+        self.flags["SHORTS_IGNORED"] = None
         return np.where(values < 0, 0.0, values)
 
     def _directions(self, t: int, values: np.ndarray) -> None:
@@ -438,7 +458,17 @@ class Simulation:
         if target == self.q[j] or (target != 0 and abs(target - self.q[j]) < self.lot):
             self.pending.pop(j, None)
             return
-        self.pending[j] = _Order(float(target), reason)
+        self.pending[j] = _Order(float(target), reason, self.t)
+
+    def exit_position(self, t: int, j: int, price: float, reason: str) -> None:
+        """Closes a whole position at a price, as an intrabar exit does; when it cannot fill there, it stays pending
+        with its reason. It replaces the symbol's pending order."""
+        self.pending.pop(j, None)
+        prices = np.full(len(self.q), np.nan)
+        prices[j] = price
+        exit_order = {j: _Order(0.0, reason, t)}
+        self.fill(t, prices, exit_order)
+        self.pending.update(exit_order)
 
     # ----- fills (§10.5) -----
 
@@ -452,7 +482,7 @@ class Simulation:
             reduce, increase = self._legs(j, orders[j].target)
             if reduce:
                 if self._can_fill(t, j, buy=reduce > 0, increasing=False):
-                    self._execute(t, j, reduce, prices[j], orders[j].reason, increasing=False)
+                    self._execute(t, j, reduce, prices[j], orders[j], increasing=False)
                 else:
                     blocked.add(j)
             if increase:
@@ -464,7 +494,7 @@ class Simulation:
         for j, increase in increases:
             quantity = np.sign(increase) * to_lot(abs(increase) * scale, self.lot)
             if quantity:
-                self._execute(t, j, quantity, prices[j], orders[j].reason, increasing=True)
+                self._execute(t, j, quantity, prices[j], orders[j], increasing=True)
         for j in list(orders):
             if j not in blocked or self.q[j] == orders[j].target:
                 orders.pop(j)
@@ -539,7 +569,8 @@ class Simulation:
             charge -= (self.costs.tax_rate(j, day) - self.costs.tax_rate(j, day, True)) * day_trade * average / 100
         return charge
 
-    def _execute(self, t: int, j: int, change: float, raw: float, reason: str, increasing: bool) -> None:
+    def _execute(self, t: int, j: int, change: float, raw: float, order: _Order, increasing: bool) -> None:
+        reason = order.reason
         buy = change > 0
         quantity = abs(change)
         price = self.costs.fill_price(raw, buy)
@@ -555,7 +586,7 @@ class Simulation:
         self.fills.append(Fill(time, self.timeline.symbols[j], side, float(quantity), float(price), float(charge), reason))
         if increasing:
             if j not in self.open_trades:
-                self.open_trades[j] = _OpenTrade(side=1 if buy else -1, entry_time=time)
+                self.open_trades[j] = OpenTrade(1 if buy else -1, time, entry_bar=t, signal_bar=order.signal_bar)
             self.open_trades[j].add(quantity, price, charge, held)
             return
         self.open_trades[j].reduce(quantity, price, charge)
@@ -632,7 +663,7 @@ class Simulation:
             unrealized = (self.price[j] - trade.average) * abs(self.q[j]) * trade.side
             self.trades.append(trade.close(timeline.symbols[j], int(timeline.time[last]), "OPEN", float(self.price[j]), unrealized))
             if not np.isfinite(self.close[last, j]):
-                self.flags.add("DATA_ENDED")
+                self.flags["DATA_ENDED"] = None
         columns = list(zip(*self._records)) if self._records else [()] * 6
         time, equity, cash, long_value, short_value, quantity = columns
         equity, long_value, short_value = (np.array(c, dtype=np.float64) for c in (equity, long_value, short_value))
@@ -644,6 +675,6 @@ class Simulation:
             time=np.array(time, dtype=np.int64), equity=equity, cash=np.array(cash, dtype=np.float64),
             long_value=long_value, short_value=short_value, gross=gross, net=net,
             positions=(quantity != 0).sum(axis=1), quantity=quantity, trades=tuple(self.trades), fills=tuple(self.fills),
-            flags=frozenset(self.flags), holdings=self.q.copy(),
+            flags=dict(self.flags), holdings=self.q.copy(),
             pending={j: order.target for j, order in sorted(self.pending.items())},
         )
