@@ -46,3 +46,10 @@ Covers SPEC.md §9.1 to §9.4. Acceptance: AC-12.
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-12 holds.** `.venv/bin/python -m pytest -q`: 822 passed (also with `-X dev -W error`). Every built-in's targets pass the truncation test exactly; DCA passes it through its fills.
+- Built as planned. `validate_config` accepts only `builtin` strategies for now (`STRATEGY_SOURCES`); prompts 10 and 12 add `plugin` and `rule` with their validation and their branch of `strategy_factory`.
+- A built-in's parameters are stored complete in the configuration, defaults included, so a saved run replays exactly.
+- **For prompt 10:** `params.parse_schema` reads a plugin's `PARAMS`; `builtins.View` is the shape the plugin `bars` object can wrap (adjusted `Inputs`, days, DTB3, first trading bar); DCA shows an ORDERS strategy over `engine.Book`.

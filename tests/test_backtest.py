@@ -15,6 +15,7 @@ from btlab.backtest import (
     load_run,
     run_backtest,
     save_result,
+    strategy_factory,
     trades_csv,
     validate_config,
 )
@@ -87,7 +88,13 @@ def run(store: Store, **changes):
         ({"intraday": {"close_out": "NONE"}}, "intraday"),
         ({"strategy": {"source": "magic", "id": "X"}}, "strategy.source"),
         ({"strategy": {"source": "builtin"}}, "strategy.id"),
-        ({"strategy": {"source": "builtin", "id": "X", "params": [1]}}, "strategy.params"),
+        ({"strategy": {"source": "builtin", "id": "MA_CROSS", "params": [1]}}, "strategy.params"),
+        ({"strategy": {"source": "builtin", "id": "NOPE"}}, "strategy.id"),
+        ({"strategy": {"source": "builtin", "id": "MA_CROSS", "params": {"fast": 2.5}}}, "strategy.params.fast"),
+        ({"strategy": {"source": "builtin", "id": "MA_CROSS", "params": {"fast": 60}}}, "strategy.params.fast"),
+        ({"strategy": {"source": "builtin", "id": "MA_CROSS", "params": {"speed": 1}}}, "strategy.params.speed"),
+        ({"strategy": {"source": "builtin", "id": "RSI", "params": {"upper": True}}}, "strategy.params.upper"),
+        ({"strategy": {"source": "builtin", "id": "DUAL_MOMENTUM", "params": {"safe": "TLT"}}}, "strategy.params.safe"),
         ({"sizing": {"mode": "KELLY"}}, "sizing.mode"),
         ({"sizing": {"mode": "FIXED_AMOUNT"}}, "sizing.amount"),
         ({"sizing": {"mode": "FIXED_FRACTION", "fraction": 1.5}}, "sizing.fraction"),
@@ -131,7 +138,8 @@ def test_the_markets_defaults_fill_the_configuration():
     us = validate_config(config())
     assert us.document == {
         "name": "MA cross", "market": "US", "symbols": ["AAA", "BBB"], "list_id": None, "start": "2019-09-03", "end": None,
-        "timeframe": "1d", "strategy": {"source": "builtin", "id": "MA_CROSS", "params": {}},
+        "timeframe": "1d",
+        "strategy": {"source": "builtin", "id": "MA_CROSS", "params": {"fast": 20, "slow": 50, "ma": "SMA", "allow_short": False}},
         "sizing": {"mode": "FIXED_FRACTION", "fraction": None},
         "exits": {"stop_loss_pct": None, "take_profit_pct": None, "trailing_pct": None, "atr_stop": None,
                   "max_hold_bars": None, "ibguard": None},
@@ -255,3 +263,11 @@ def test_a_tw_run_pays_transaction_taxes(store):
 def test_the_minute_path_without_minute_bars_falls_back(store):
     result = run(store, intrabar_path="MINUTE", exits={"stop_loss_pct": 5})
     assert result.flags["PATH_FALLBACK"] > 0
+
+
+def test_a_builtin_runs_from_its_configuration(store):
+    validated = validate_config(config(strategy={"source": "builtin", "id": "MA_CROSS", "params": {"fast": 10, "slow": 30}}))
+    result = run_backtest(validated, load_run(store, None, validated), TAXES, strategy_factory(validated))
+    expected = run(store)  # the test's own MA cross of 10 and 30 bars
+    assert result.series["EQUITY"].tobytes() == expected.series["EQUITY"].tobytes()
+    assert result.config["strategy"]["params"] == {"fast": 10, "slow": 30, "ma": "SMA", "allow_short": False}

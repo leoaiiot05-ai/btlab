@@ -243,6 +243,13 @@ class Book:
     def order_value(self, j: int, amount: float) -> None:
         self.order_qty(j, amount / self.price(j))
 
+    def buy_cost(self, j: int, value: float) -> float:
+        """The cash a buy of about `value` at this close needs, with slippage and commission."""
+        simulation = self._simulation
+        quantity = to_lot(value / self.price(j), simulation.lot)
+        price = simulation.costs.fill_price(self.price(j), buy=True)
+        return quantity * price + simulation.costs.commission(quantity, quantity * price)
+
 
 class Simulation:
     """The state of one run. Exit overlays act on it through the Exits hook: they read the prices of the run's price

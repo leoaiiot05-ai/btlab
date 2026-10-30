@@ -15,11 +15,13 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
+from btlab.builtins import BUILTINS, View
 from btlab.calendar import session
 from btlab.costs import CostModel
 from btlab.engine import EngineResult, OrderStrategy, Settings, Targets, daily_timeline, simulate
 from btlab.exits import DailyMinutePaths, ExitRules, Overlays
 from btlab.features import session_bars
+from btlab.indicators import Inputs
 from btlab.markets import MARKETS, PerShareCommission, RateCommission, category_by_rule, normalize_symbol
 from btlab.metrics import (
     Curve,
@@ -32,6 +34,7 @@ from btlab.metrics import (
     risk_free,
     trade_metrics,
 )
+from btlab.params import validate_params
 from btlab.prices import Aligned, align
 from btlab.records import MinuteBars, ShortSuspension, Trade, to_date, to_day
 from btlab.sizing import SIZING_MODES, Sizing
@@ -41,7 +44,8 @@ from btlab.taxes import TaxTable
 # Daily data load from this many bars before the start, for the indicators' warm-up (§10.1).
 WARMUP_BARS = 300
 TIMEFRAMES = ("1d",)
-STRATEGY_SOURCES = ("builtin", "plugin", "rule")
+# Plugins (prompt 10) and rules (prompt 12) add their sources.
+STRATEGY_SOURCES = ("builtin",)
 PRICE_MODES = ("REALISTIC", "ADJUSTED")
 FILL_TIMINGS = ("NEXT_OPEN", "SAME_CLOSE")
 INTRABAR_PATHS = ("DAILY", "MINUTE")
@@ -154,7 +158,7 @@ def validate_config(raw: Any) -> RunConfig:
         errors.append(("end", "must not be before start"))
     timeframe = top.get("timeframe", _choice(*TIMEFRAMES), "1d")
     top.get("intraday", _null, None)
-    strategy = _strategy(raw.get("strategy"), errors)
+    strategy = _strategy(raw.get("strategy"), errors, market, symbols)
     sizing = _sizing(raw.get("sizing", {"mode": "FIXED_FRACTION"}), errors)
     exits = _exits(raw.get("exits", {}), errors)
     costs = _costs(market, raw.get("costs", {}), errors)
@@ -318,19 +322,35 @@ def _symbols(market: str, value: Any, errors: list[tuple[str, str]]) -> tuple[st
     return tuple(found)
 
 
-def _strategy(value: Any, errors: list[tuple[str, str]]) -> dict:
-    """The source, its id or rule, and an object of parameters; each source checks its parameters (prompts 9, 10, 12)."""
+def _strategy(value: Any, errors: list[tuple[str, str]], market: str, symbols: tuple[str, ...]) -> dict:
+    """The source, its id and its parameters, checked against the strategy's schema (§9.2) and stored complete."""
     if value is None:
         errors.append(("strategy", "is required"))
         return {}
-    fields = _Object(value, "strategy", errors, {"source", "id", "params", "rule"})
+    fields = _Object(value, "strategy", errors, {"source", "id", "params"})
     source = fields.get("source", _choice(*STRATEGY_SOURCES))
-    document = {"source": source, "params": fields.get("params", _object, {})}
-    if source == "rule":
-        document["rule"] = fields.get("rule", _object)
-    elif source is not None:
-        document["id"] = fields.get("id", _text)
-    return document
+    strategy_id = fields.get("id", _text)
+    params = fields.get("params", _object, {})
+    builtin = BUILTINS.get(strategy_id) if source == "builtin" else None
+    if source == "builtin" and strategy_id is not None and builtin is None:
+        errors.append(("strategy.id", "is not a built-in strategy"))
+    if builtin is not None and params is not None:
+        params, found = validate_params(builtin.schema(market, symbols), params, "strategy.params")
+        errors.extend(found or [(f"strategy.params.{name}", message) for name, message in builtin.check(params)])
+    return {"source": source, "id": strategy_id, "params": params}
+
+
+def strategy_factory(config: RunConfig) -> StrategyFactory:
+    """The factory run_backtest takes, for a validated configuration."""
+    builtin, params = BUILTINS[config.strategy["id"]], config.strategy["params"]
+    return lambda data: builtin.run(view(data), params)
+
+
+def view(data: RunData) -> View:
+    """What a strategy reads: the adjusted bars from the warm-up on (§10.2)."""
+    aligned = data.aligned
+    bars = Inputs(aligned.adj_open, aligned.adj_high, aligned.adj_low, aligned.adj_close, aligned.adj_volume)
+    return View(aligned.symbols, aligned.days, bars, data.rf, data.start)
 
 
 def _object(value: Any) -> dict:
