@@ -45,3 +45,10 @@ Covers SPEC.md §8. Acceptance: AC-6.
 ## 4. Deferred items (appended to TODO.md)
 
 - None.
+
+## Result
+
+- **AC-6 holds.** `.venv/bin/python -m pytest -q`: 531 passed (also with `-X dev -W error`). Every registry operand passes the truncation test exactly (bit for bit), for removed and for replaced later bars.
+- `tests/test_purity.py` now parses calls instead of searching text, and covers indicators.py, features.py and registry.py.
+- Timing at production size (50 symbols × 7,800 daily bars, this VM): SMA(400) 0.02 s, EMA(200) 0.04 s, RSI 0.1 s, MACD 0.14 s, HIGHEST(250) 0.07 s, STDEV(200) 0.4 s.
+- **For prompt 12:** `registry.operands(series)` and `default_args`; `compute(data, args)` takes `Inputs` (indicators, today-so-far) or one `SessionBars` per symbol (features). Argument validation against `Arg` ranges is the rule builder's (BAD_ARGS).
